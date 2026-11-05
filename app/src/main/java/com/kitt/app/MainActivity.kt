@@ -206,7 +206,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
             val r = brain.think(text)
             runOnUiThread {
                 val failure = commands.run(r.action, r.arg)
-                speak(failure ?: r.reply)
+                val said = failure ?: r.reply
+                setStatus(said)
+                speak(said)
             }
         }.start()
     }

@@ -8,9 +8,11 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -28,6 +30,8 @@ import java.util.zip.ZipInputStream
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, RecognitionListener {
     private lateinit var scanner: ScannerView
     private lateinit var hint: TextView
+    private lateinit var brain: Brain
+    private lateinit var commands: Commands
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var model: Model? = null
@@ -69,10 +73,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         root.addView(hint)
         setContentView(root)
 
+        brain = Brain(this)
+        commands = Commands(this)
         tts = TextToSpeech(this, this)
         prepareModel()
 
         root.setOnClickListener { toggleListening() }
+        root.setOnLongClickListener {
+            askKey()
+            true
+        }
+    }
+
+    private fun askKey() {
+        val input = EditText(this)
+        input.hint = "Incolla qui la chiave Groq"
+        AlertDialog.Builder(this)
+            .setTitle("Chiave Groq")
+            .setView(input)
+            .setPositiveButton("Salva") { _, _ ->
+                val k = input.text.toString().trim()
+                getSharedPreferences("kitt", MODE_PRIVATE)
+                    .edit().putString("groq_key", k).apply()
+                Toast.makeText(this, "Chiave salvata", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Annulla", null)
+            .show()
     }
 
     private fun setStatus(text: String) {
@@ -108,7 +134,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
                 }
                 setStatus("Carico il modello...")
                 model = Model(modelDir.absolutePath)
-                setStatus("Pronto. Tocca lo schermo e parla")
+                setStatus("Pronto. Tocca e parla. Tieni premuto per inserire la chiave")
             } catch (e: Exception) {
                 setStatus("Errore: " + e.message)
             }
@@ -166,8 +192,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         }
         if (text.isNotBlank()) {
             setStatus("Hai detto: $text")
-            speak(Commands(this).handle(text))
+            process(text)
         }
+    }
+
+    private fun process(text: String) {
+        if (!brain.hasKey()) {
+            speak(commands.handle(text))
+            return
+        }
+        runOnUiThread { scanner.start() }
+        Thread {
+            val r = brain.think(text)
+            runOnUiThread {
+                val failure = commands.run(r.action, r.arg)
+                speak(failure ?: r.reply)
+            }
+        }.start()
     }
 
     override fun onFinalResult(hypothesis: String?) {}
@@ -213,8 +254,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
     }
 
     private fun speak(text: String) {
-        if (ttsReady) {
+        if (ttsReady && text.isNotBlank()) {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
+        } else {
+            scanner.stop()
         }
     }
 

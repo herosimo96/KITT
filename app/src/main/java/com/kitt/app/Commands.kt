@@ -12,20 +12,24 @@ class Commands(private val context: Context) {
         val t = raw.lowercase().trim()
         return when {
             t.startsWith("apri ") -> openApp(t.removePrefix("apri ").trim())
-            "volume" in t && ("alza" in t || "aumenta" in t) -> {
-                repeat(3) { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, 0) }
-                "Volume alzato"
-            }
-            "volume" in t && ("abbassa" in t || "diminuisci" in t) -> {
-                repeat(3) { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, 0) }
-                "Volume abbassato"
-            }
+            "volume" in t && ("alza" in t || "aumenta" in t) -> changeVolume(true)
+            "volume" in t && ("abbassa" in t || "diminuisci" in t) -> changeVolume(false)
             "successiv" in t || "prossim" in t -> { media(KeyEvent.KEYCODE_MEDIA_NEXT); "Canzone successiva" }
             "precedent" in t -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); "Canzone precedente" }
             "pausa" in t -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); "Musica in pausa" }
             "riproduci" in t || "riprendi" in t || "play" in t -> { media(KeyEvent.KEYCODE_MEDIA_PLAY); "Riproduco" }
             else -> "Hai detto: $raw. Non conosco ancora questo comando."
         }
+    }
+
+    private fun changeVolume(up: Boolean): String {
+        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val before = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val step = maxOf(1, max / 5)
+        val target = (if (up) before + step else before - step).coerceIn(0, max)
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+        val after = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+        return "Volume $after su $max"
     }
 
     private fun media(code: Int) {

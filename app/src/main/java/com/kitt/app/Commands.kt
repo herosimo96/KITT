@@ -1,20 +1,42 @@
 package com.kitt.app
 
+import android.Manifest
+import android.app.Activity
+import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.BatteryManager
+import android.provider.AlarmClock
+import android.provider.ContactsContract
+import android.provider.MediaStore
 import android.provider.Settings
+import android.telephony.SmsManager
 import android.view.KeyEvent
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 class Commands(private val context: Context) {
     private val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var pendingSms: Triple<String, String, String>? = null
 
-    // Esegue l'azione scelta dall'AI. Restituisce null se tutto ok,
-    // oppure un messaggio da dire se qualcosa non è andato.
+    private val permMsg = "Mi servono dei permessi: concedili e ripeti il comando."
+
+    // Esegue l'azione scelta dall'AI. Restituisce null se tutto ok
+    // (KITT dice la risposta dell'AI), oppure un messaggio da dire al suo posto.
     fun run(action: String, arg: String): String? {
+        return try {
+            execute(action, arg.trim())
+        } catch (e: Exception) {
+            "Non sono riuscito a eseguire il comando."
+        }
+    }
+
+    private fun execute(action: String, arg: String): String? {
         return when (action) {
             "open_app" -> {
                 val r = openApp(arg.lowercase().trim())
@@ -53,6 +75,23 @@ class Commands(private val context: Context) {
             "previous_track" -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); null }
             "pause" -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); null }
             "play" -> { media(KeyEvent.KEYCODE_MEDIA_PLAY); null }
+            "stop" -> { media(KeyEvent.KEYCODE_MEDIA_STOP); null }
+            "play_music" -> playMusic(arg)
+            "call" -> call(arg)
+            "send_sms" -> prepareSms(arg)
+            "confirm" -> confirmSms()
+            "cancel" -> { pendingSms = null; null }
+            "whatsapp" -> whatsapp(arg)
+            "navigate" -> view("geo:0,0?q=" + Uri.encode(arg))
+            "web_search" -> view("https://duckduckgo.com/?q=" + Uri.encode(arg))
+            "open_url" -> view(if (arg.startsWith("http")) arg else "https://$arg")
+            "youtube" -> view("https://www.youtube.com/results?search_query=" + Uri.encode(arg))
+            "set_alarm" -> setAlarm(arg)
+            "set_timer" -> setTimer(arg)
+            "open_settings" -> openSettings(arg)
+            "open_camera" -> start(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            "go_home" -> start(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME))
+            "battery" -> battery()
             else -> null
         }
     }
@@ -72,6 +111,21 @@ class Commands(private val context: Context) {
         }
     }
 
+    // ---------- permessi ----------
+
+    private fun ensure(vararg perms: String): Boolean {
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) return true
+        (context as? Activity)?.let {
+            ActivityCompat.requestPermissions(it, missing.toTypedArray(), 3)
+        }
+        return false
+    }
+
+    // ---------- audio ----------
+
     private fun changeVolume(up: Boolean): String {
         val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val before = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -87,6 +141,26 @@ class Commands(private val context: Context) {
         val target = (max * percent.coerceIn(0, 100) / 100)
         audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
     }
+
+    private fun media(code: Int) {
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+    }
+
+    private fun playMusic(query: String): String? {
+        val i = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+        i.putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+        i.putExtra(SearchManager.QUERY, query)
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return try {
+            context.startActivity(i)
+            null
+        } catch (e: Exception) {
+            "Nessuna app musicale risponde a questa richiesta."
+        }
+    }
+
+    // ---------- schermo e torcia ----------
 
     private fun getBrightness(): Int =
         Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
@@ -124,9 +198,121 @@ class Commands(private val context: Context) {
         }
     }
 
-    private fun media(code: Int) {
-        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+    // ---------- contatti, chiamate e messaggi ----------
+
+    private fun resolve(who: String): Pair<String, String>? {
+        if (Regex("^[+0-9 ]{6,}$").matches(who)) {
+            return Pair(who, who.replace(" ", ""))
+        }
+        val cursor = context.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+            arrayOf("%" + who + "%"),
+            null
+        )
+        cursor?.use {
+            if (it.moveToFirst()) {
+                return Pair(it.getString(0), it.getString(1))
+            }
+        }
+        return null
+    }
+
+    private fun call(who: String): String? {
+        if (!ensure(Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE)) return permMsg
+        val t = resolve(who) ?: return "Non trovo $who in rubrica."
+        val i = Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(t.second)))
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(i)
+        return "Chiamo " + t.first
+    }
+
+    private fun prepareSms(arg: String): String? {
+        if (!ensure(Manifest.permission.READ_CONTACTS, Manifest.permission.SEND_SMS)) return permMsg
+        val parts = arg.split("|", limit = 2)
+        if (parts.size < 2 || parts[1].isBlank()) return "Non ho capito il testo del messaggio."
+        val who = parts[0].trim()
+        val text = parts[1].trim()
+        val t = resolve(who) ?: return "Non trovo $who in rubrica."
+        pendingSms = Triple(t.second, t.first, text)
+        return "Ho scritto a " + t.first + ": " + text + ". Lo invio?"
+    }
+
+    @Suppress("DEPRECATION")
+    private fun confirmSms(): String? {
+        val p = pendingSms ?: return null
+        pendingSms = null
+        val sms = SmsManager.getDefault()
+        sms.sendMultipartTextMessage(p.first, null, sms.divideMessage(p.third), null, null)
+        return "Messaggio inviato a " + p.second
+    }
+
+    private fun whatsapp(arg: String): String? {
+        if (!ensure(Manifest.permission.READ_CONTACTS)) return permMsg
+        val parts = arg.split("|", limit = 2)
+        val who = parts[0].trim()
+        val text = if (parts.size > 1) parts[1].trim() else ""
+        val t = resolve(who) ?: return "Non trovo $who in rubrica."
+        var num = t.second.filter { it.isDigit() }
+        if (num.startsWith("00")) num = num.removePrefix("00")
+        else if (!t.second.startsWith("+") && num.length == 10 && num.startsWith("3")) num = "39$num"
+        val r = view("https://wa.me/" + num + "?text=" + Uri.encode(text))
+        return r ?: "Ho aperto la chat con " + t.first + ": tocca invia."
+    }
+
+    // ---------- internet, mappe, utilità ----------
+
+    private fun start(i: Intent): String? {
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return try {
+            context.startActivity(i)
+            null
+        } catch (e: Exception) {
+            "Non ho un'app per farlo."
+        }
+    }
+
+    private fun view(uri: String): String? = start(Intent(Intent.ACTION_VIEW, Uri.parse(uri)))
+
+    private fun setAlarm(arg: String): String? {
+        val m = Regex("(\\d{1,2})[:.](\\d{2})").find(arg) ?: return "Non ho capito l'orario."
+        val i = Intent(AlarmClock.ACTION_SET_ALARM)
+            .putExtra(AlarmClock.EXTRA_HOUR, m.groupValues[1].toInt())
+            .putExtra(AlarmClock.EXTRA_MINUTES, m.groupValues[2].toInt())
+            .putExtra(AlarmClock.EXTRA_MESSAGE, "KITT")
+            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        return start(i)
+    }
+
+    private fun setTimer(arg: String): String? {
+        val sec = arg.toIntOrNull() ?: return "Non ho capito la durata."
+        val i = Intent(AlarmClock.ACTION_SET_TIMER)
+            .putExtra(AlarmClock.EXTRA_LENGTH, sec)
+            .putExtra(AlarmClock.EXTRA_MESSAGE, "KITT")
+            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        return start(i)
+    }
+
+    private fun openSettings(arg: String): String? {
+        val action = when (arg.lowercase()) {
+            "wifi" -> Settings.ACTION_WIFI_SETTINGS
+            "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+            "display" -> Settings.ACTION_DISPLAY_SETTINGS
+            "sound" -> Settings.ACTION_SOUND_SETTINGS
+            "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+            else -> Settings.ACTION_SETTINGS
+        }
+        return start(Intent(action))
+    }
+
+    private fun battery(): String {
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        return "La batteria è al $pct per cento."
     }
 
     private fun openApp(name: String): String {

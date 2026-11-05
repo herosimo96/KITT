@@ -8,6 +8,26 @@ import android.view.KeyEvent
 class Commands(private val context: Context) {
     private val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    // Esegue l'azione scelta dall'AI. Restituisce null se tutto ok,
+    // oppure un messaggio da dire se qualcosa non è andato.
+    fun run(action: String, arg: String): String? {
+        return when (action) {
+            "open_app" -> {
+                val r = openApp(arg.lowercase().trim())
+                if (r.startsWith("Apro ")) null else r
+            }
+            "volume_up" -> { changeVolume(true); null }
+            "volume_down" -> { changeVolume(false); null }
+            "volume_set" -> { setVolume(arg.toIntOrNull() ?: 50); null }
+            "next_track" -> { media(KeyEvent.KEYCODE_MEDIA_NEXT); null }
+            "previous_track" -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); null }
+            "pause" -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); null }
+            "play" -> { media(KeyEvent.KEYCODE_MEDIA_PLAY); null }
+            else -> null
+        }
+    }
+
+    // Comandi di emergenza, quando manca la chiave o internet
     fun handle(raw: String): String {
         val t = raw.lowercase().trim()
         return when {
@@ -18,7 +38,7 @@ class Commands(private val context: Context) {
             "precedent" in t -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); "Canzone precedente" }
             "pausa" in t -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); "Musica in pausa" }
             "riproduci" in t || "riprendi" in t || "play" in t -> { media(KeyEvent.KEYCODE_MEDIA_PLAY); "Riproduco" }
-            else -> "Hai detto: $raw. Non conosco ancora questo comando."
+            else -> "Hai detto: $raw. Per capire frasi libere serve la chiave Groq."
         }
     }
 
@@ -30,6 +50,12 @@ class Commands(private val context: Context) {
         audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
         val after = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
         return "Volume $after su $max"
+    }
+
+    private fun setVolume(percent: Int) {
+        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val target = (max * percent.coerceIn(0, 100) / 100)
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
     }
 
     private fun media(code: Int) {

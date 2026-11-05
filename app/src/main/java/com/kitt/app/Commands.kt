@@ -2,7 +2,11 @@ package com.kitt.app
 
 import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.media.AudioManager
+import android.net.Uri
+import android.provider.Settings
 import android.view.KeyEvent
 
 class Commands(private val context: Context) {
@@ -19,6 +23,32 @@ class Commands(private val context: Context) {
             "volume_up" -> { changeVolume(true); null }
             "volume_down" -> { changeVolume(false); null }
             "volume_set" -> { setVolume(arg.toIntOrNull() ?: 50); null }
+            "mute" -> {
+                audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI)
+                null
+            }
+            "unmute" -> {
+                audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, AudioManager.FLAG_SHOW_UI)
+                null
+            }
+            "brightness_up" -> {
+                if (!Settings.System.canWrite(context)) askWritePermission()
+                else { setBrightness(getBrightness() + 50); null }
+            }
+            "brightness_down" -> {
+                if (!Settings.System.canWrite(context)) askWritePermission()
+                else { setBrightness(getBrightness() - 50); null }
+            }
+            "brightness_set" -> {
+                if (!Settings.System.canWrite(context)) askWritePermission()
+                else {
+                    val p = (arg.toIntOrNull() ?: 50).coerceIn(0, 100)
+                    setBrightness(255 * p / 100)
+                    null
+                }
+            }
+            "flashlight_on" -> torch(true)
+            "flashlight_off" -> torch(false)
             "next_track" -> { media(KeyEvent.KEYCODE_MEDIA_NEXT); null }
             "previous_track" -> { media(KeyEvent.KEYCODE_MEDIA_PREVIOUS); null }
             "pause" -> { media(KeyEvent.KEYCODE_MEDIA_PAUSE); null }
@@ -56,6 +86,42 @@ class Commands(private val context: Context) {
         val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val target = (max * percent.coerceIn(0, 100) / 100)
         audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+    }
+
+    private fun getBrightness(): Int =
+        Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+
+    private fun setBrightness(value: Int) {
+        val v = value.coerceIn(5, 255)
+        Settings.System.putInt(
+            context.contentResolver,
+            Settings.System.SCREEN_BRIGHTNESS_MODE,
+            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
+        )
+        Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, v)
+    }
+
+    private fun askWritePermission(): String {
+        val i = Intent(
+            Settings.ACTION_MANAGE_WRITE_SETTINGS,
+            Uri.parse("package:" + context.packageName)
+        )
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(i)
+        return "Per regolare la luminosità mi serve un permesso: attivalo nella schermata che si è aperta, poi ripetimi il comando."
+    }
+
+    private fun torch(on: Boolean): String? {
+        return try {
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val id = cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: return "Questo dispositivo non ha il flash"
+            cm.setTorchMode(id, on)
+            null
+        } catch (e: Exception) {
+            "Non riesco ad usare la torcia"
+        }
     }
 
     private fun media(code: Int) {

@@ -35,7 +35,8 @@ class Brain(private val context: Context) {
                 .put("model", MODEL)
                 .put("messages", messages)
                 .put("temperature", 0.7)
-                .put("max_tokens", 200)
+                .put("max_tokens", 1500)
+             .put("reasoning_effort", "low")
                 .put("response_format", JSONObject().put("type", "json_object"))
 
             val conn = URL("https://api.groq.com/openai/v1/chat/completions")

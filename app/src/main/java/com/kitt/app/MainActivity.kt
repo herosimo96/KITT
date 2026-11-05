@@ -166,7 +166,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         }
         if (text.isNotBlank()) {
             setStatus("Hai detto: $text")
-            speak("Hai detto: $text")
+            speak(Commands(this).handle(text))
         }
     }
 

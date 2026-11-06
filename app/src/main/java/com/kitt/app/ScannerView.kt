@@ -13,11 +13,14 @@ class ScannerView(context: Context) : View(context) {
     private val segments = 24
     private var position = -10f
     private var animator: ValueAnimator? = null
+    private var currentDuration = 0L
 
-    fun start() {
-        if (animator?.isRunning == true) return
+    fun start(durationMs: Long = 900L) {
+        if (animator?.isRunning == true && currentDuration == durationMs) return
+        animator?.cancel()
+        currentDuration = durationMs
         animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 900
+            duration = durationMs
             repeatMode = ValueAnimator.REVERSE
             repeatCount = ValueAnimator.INFINITE
             interpolator = LinearInterpolator()
@@ -34,6 +37,11 @@ class ScannerView(context: Context) : View(context) {
         animator = null
         position = -10f
         invalidate()
+    }
+
+    override fun onDetachedFromWindow() {
+        animator?.cancel()
+        super.onDetachedFromWindow()
     }
 
     override fun onDraw(canvas: Canvas) {

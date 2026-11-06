@@ -56,10 +56,15 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private lateinit var brain: Brain
     private lateinit var commands: Commands
     private lateinit var voice: VoiceListener
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var triedFallback = false
     private var ttsProblem = ""
+    private var engines: List<String> = emptyList()
+    private val triedEngines = mutableSetOf<String>()
+    private var currentEngine = "predefinito"
+    private val ttsLog = StringBuilder()
+
     private var voiceStarted = false
     private var busy = false
     private var wakeModel: Model? = null
@@ -392,36 +397,49 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }.start()
     }
 
-    // ---------- voce di KITT ----------
+    // ---------- voce di KITT: prova tutti i motori finché uno parla italiano ----------
 
     override fun onInit(initStatus: Int) {
-        if (initStatus != TextToSpeech.SUCCESS) {
-            if (!triedFallback) {
-                triedFallback = true
-                tts?.shutdown()
-                tts = TextToSpeech(this, this, ESPEAK)
-                return
+        val t = tts ?: return
+        if (engines.isEmpty()) {
+            try {
+                engines = t.engines.map { it.name }
+            } catch (e: Exception) {
             }
-            ttsProblem = "Voce: nessun motore vocale. Installa eSpeak NG."
-            setStatus("Nessun motore vocale trovato")
-            return
         }
-        val result = tts?.setLanguage(Locale.ITALIAN)
-        ttsReady = result != TextToSpeech.LANG_MISSING_DATA &&
-                result != TextToSpeech.LANG_NOT_SUPPORTED
-        if (!ttsReady && !triedFallback) {
-            triedFallback = true
-            tts?.shutdown()
-            tts = TextToSpeech(this, this, ESPEAK)
-            return
-        }
-        if (!ttsReady) {
-            ttsProblem = "Voce: italiano non disponibile. Installa eSpeak NG."
-            setStatus("Voce italiana non disponibile")
+        val name = if (currentEngine == "predefinito") {
+            try {
+                t.defaultEngine ?: "predefinito"
+            } catch (e: Exception) {
+                "predefinito"
+            }
         } else {
-            ttsProblem = ""
+            currentEngine
         }
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+        currentEngine = name
+        triedEngines.add(name)
+
+        if (initStatus != TextToSpeech.SUCCESS) {
+            ttsLog.append("[" + name + ": non si avvia] ")
+            nextEngine()
+            return
+        }
+
+        var best = TextToSpeech.LANG_NOT_SUPPORTED
+        for (loc in listOf(Locale.ITALIAN, Locale.ITALY, Locale("it", "IT"))) {
+            val r = t.setLanguage(loc)
+            if (r > best) best = r
+            if (r >= TextToSpeech.LANG_AVAILABLE) break
+        }
+        if (best < TextToSpeech.LANG_AVAILABLE) {
+            ttsLog.append("[" + name + ": italiano codice " + best + "] ")
+            nextEngine()
+            return
+        }
+
+        ttsReady = true
+        ttsProblem = ""
+        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 voice.paused = true
                 scan(true)
@@ -438,6 +456,23 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 resumeListening()
             }
         })
+        setStatus("Voce pronta (" + name + ")")
+    }
+
+    private fun nextEngine() {
+        val next = engines
+            .filter { it !in triedEngines }
+            .sortedBy { if (it == ESPEAK) 0 else 1 }
+            .firstOrNull()
+        if (next == null) {
+            val list = if (engines.isEmpty()) "nessuno" else engines.joinToString(", ")
+            ttsProblem = "Voce: italiano non disponibile. Motori trovati: " + list + ". " + ttsLog
+            setStatus("Nessuna voce italiana")
+            return
+        }
+        currentEngine = next
+        tts?.shutdown()
+        tts = TextToSpeech(this, this, next)
     }
 
     private fun speak(text: String) {

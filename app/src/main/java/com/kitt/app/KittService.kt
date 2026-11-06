@@ -49,6 +49,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_WAKE = "com.kitt.app.WAKE"
         private const val CHANNEL = "kitt"
         private const val NOTIF_ID = 1
+        private const val ESPEAK = "com.reecedunn.espeak"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -57,6 +58,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private lateinit var voice: VoiceListener
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var triedFallback = false
+    private var ttsProblem = ""
     private var voiceStarted = false
     private var busy = false
     private var wakeModel: Model? = null
@@ -261,8 +264,9 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     // ---------- stato e scanner ----------
 
     private fun setStatus(text: String) {
-        lastStatus = text
-        handler.post { ui?.status(text) }
+        val full = if (ttsProblem.isNotBlank()) text + "\n" + ttsProblem else text
+        lastStatus = full
+        handler.post { ui?.status(full) }
     }
 
     private fun scan(on: Boolean) {
@@ -388,16 +392,34 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }.start()
     }
 
+    // ---------- voce di KITT ----------
+
     override fun onInit(initStatus: Int) {
         if (initStatus != TextToSpeech.SUCCESS) {
+            if (!triedFallback) {
+                triedFallback = true
+                tts?.shutdown()
+                tts = TextToSpeech(this, this, ESPEAK)
+                return
+            }
+            ttsProblem = "Voce: nessun motore vocale. Installa eSpeak NG."
             setStatus("Nessun motore vocale trovato")
             return
         }
         val result = tts?.setLanguage(Locale.ITALIAN)
         ttsReady = result != TextToSpeech.LANG_MISSING_DATA &&
                 result != TextToSpeech.LANG_NOT_SUPPORTED
+        if (!ttsReady && !triedFallback) {
+            triedFallback = true
+            tts?.shutdown()
+            tts = TextToSpeech(this, this, ESPEAK)
+            return
+        }
         if (!ttsReady) {
+            ttsProblem = "Voce: italiano non disponibile. Installa eSpeak NG."
             setStatus("Voce italiana non disponibile")
+        } else {
+            ttsProblem = ""
         }
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {

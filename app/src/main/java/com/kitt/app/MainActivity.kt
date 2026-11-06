@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
@@ -16,27 +18,18 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import org.vosk.android.RecognitionListener
-import org.vosk.android.SpeechService
-import java.io.File
-import java.io.FileOutputStream
-import java.net.URL
 import java.util.Locale
-import java.util.zip.ZipInputStream
 
-class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, RecognitionListener {
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var scanner: ScannerView
     private lateinit var hint: TextView
     private lateinit var brain: Brain
     private lateinit var commands: Commands
+    private lateinit var voice: VoiceListener
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var model: Model? = null
-    private var speechService: SpeechService? = null
     private var listening = false
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,7 +55,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         ).apply { topMargin = 60 }
 
         hint = TextView(this).apply {
-            text = "Avvio in corso..."
             setTextColor(Color.GRAY)
             gravity = Gravity.CENTER
             setPadding(0, 60, 0, 0)
@@ -75,8 +67,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
 
         brain = Brain(this)
         commands = Commands(this)
+        voice = VoiceListener(
+            { pcm -> onUtterance(pcm) },
+            { msg -> setStatus(msg) }
+        )
         tts = TextToSpeech(this, this)
-        prepareModel()
+
+        if (brain.hasKey()) {
+            hint.text = "Pronto. Tocca per parlare. Tieni premuto per cambiare la chiave"
+        } else {
+            hint.text = "Tieni premuto lo schermo per inserire la chiave Groq"
+        }
 
         root.setOnClickListener { toggleListening() }
         root.setOnLongClickListener {
@@ -96,6 +97,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
                 getSharedPreferences("kitt", MODE_PRIVATE)
                     .edit().putString("groq_key", k).apply()
                 Toast.makeText(this, "Chiave salvata", Toast.LENGTH_SHORT).show()
+                setStatus("Pronto. Tocca per parlare")
             }
             .setNegativeButton("Annulla", null)
             .show()
@@ -105,46 +107,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         runOnUiThread { hint.text = text }
     }
 
-    private fun prepareModel() {
-        val modelDir = File(filesDir, "model/vosk-model-small-it-0.22")
-        val okFile = File(filesDir, "model/ok")
-        Thread {
-            try {
-                if (!okFile.exists()) {
-                    setStatus("Scarico il cervello vocale (circa 50 MB), attendi...")
-                    File(filesDir, "model").deleteRecursively()
-                    val url = URL("https://alphacephei.com/vosk/models/vosk-model-small-it-0.22.zip")
-                    val conn = url.openConnection()
-                    conn.connectTimeout = 15000
-                    conn.readTimeout = 30000
-                    ZipInputStream(conn.getInputStream().buffered()).use { zip ->
-                        var entry = zip.nextEntry
-                        while (entry != null) {
-                            val out = File(filesDir, "model/" + entry.name)
-                            if (entry.isDirectory) {
-                                out.mkdirs()
-                            } else {
-                                out.parentFile?.mkdirs()
-                                FileOutputStream(out).use { zip.copyTo(it) }
-                            }
-                            entry = zip.nextEntry
-                        }
-                    }
-                    okFile.writeText("ok")
-                }
-                setStatus("Carico il modello...")
-                model = Model(modelDir.absolutePath)
-                setStatus("Pronto. Tocca e parla. Tieni premuto per inserire la chiave")
-            } catch (e: Exception) {
-                setStatus("Errore: " + e.message)
-            }
-        }.start()
+    private fun resumeListening() {
+        handler.postDelayed({ voice.paused = false }, 500)
     }
 
     private fun toggleListening() {
-        val m = model
-        if (m == null) {
-            Toast.makeText(this, "Il modello non è ancora pronto", Toast.LENGTH_SHORT).show()
+        if (!brain.hasKey()) {
+            Toast.makeText(this, "Prima inserisci la chiave: tieni premuto lo schermo", Toast.LENGTH_LONG).show()
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -154,20 +123,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
             return
         }
         if (listening) {
-            speechService?.stop()
-            speechService?.shutdown()
-            speechService = null
+            voice.stop()
             listening = false
             setStatus("In pausa. Tocca per parlare")
         } else {
-            try {
-                speechService = SpeechService(Recognizer(m, 16000.0f), 16000.0f)
-                speechService?.startListening(this)
-                listening = true
-                setStatus("Ti ascolto...")
-            } catch (e: Exception) {
-                setStatus("Errore microfono: " + e.message)
-            }
+            voice.paused = false
+            voice.start()
+            listening = true
+            setStatus("Ti ascolto...")
         }
     }
 
@@ -182,27 +145,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         }
     }
 
-    override fun onPartialResult(hypothesis: String?) {}
-
-    override fun onResult(hypothesis: String?) {
-        val text = try {
-            JSONObject(hypothesis ?: "{}").optString("text")
-        } catch (e: Exception) {
-            ""
-        }
-        if (text.isNotBlank()) {
-            setStatus("Hai detto: $text")
-            process(text)
-        }
-    }
-
-    private fun process(text: String) {
-        if (!brain.hasKey()) {
-            speak(commands.handle(text))
-            return
-        }
+    private fun onUtterance(pcm: ByteArray) {
+        voice.paused = true
+        setStatus("Elaboro...")
         runOnUiThread { scanner.start() }
         Thread {
+            val (text, error) = brain.transcribe(pcm)
+            if (error.isNotBlank()) {
+                runOnUiThread { scanner.stop() }
+                setStatus(error)
+                resumeListening()
+                return@Thread
+            }
+            if (text.length < 2) {
+                runOnUiThread { scanner.stop() }
+                setStatus("Ti ascolto...")
+                resumeListening()
+                return@Thread
+            }
+            setStatus("Hai detto: $text")
             val r = brain.think(text)
             runOnUiThread {
                 val failure = commands.run(r.action, r.arg)
@@ -212,14 +173,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
             }
         }.start()
     }
-
-    override fun onFinalResult(hypothesis: String?) {}
-
-    override fun onError(exception: Exception?) {
-        setStatus("Errore ascolto: " + exception?.message)
-    }
-
-    override fun onTimeout() {}
 
     override fun onInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
@@ -234,23 +187,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
         }
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                runOnUiThread {
-                    speechService?.setPause(true)
-                    scanner.start()
-                }
+                voice.paused = true
+                runOnUiThread { scanner.start() }
             }
             override fun onDone(utteranceId: String?) {
-                runOnUiThread {
-                    scanner.stop()
-                    if (listening) speechService?.setPause(false)
-                }
+                runOnUiThread { scanner.stop() }
+                resumeListening()
             }
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
-                runOnUiThread {
-                    scanner.stop()
-                    if (listening) speechService?.setPause(false)
-                }
+                runOnUiThread { scanner.stop() }
+                resumeListening()
             }
         })
     }
@@ -260,12 +207,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener, Recogniti
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
         } else {
             scanner.stop()
+            resumeListening()
         }
     }
 
     override fun onDestroy() {
-        speechService?.shutdown()
-        model?.close()
+        voice.stop()
         tts?.shutdown()
         super.onDestroy()
     }

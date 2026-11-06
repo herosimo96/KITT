@@ -4,15 +4,25 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import org.vosk.Recognizer
 import java.io.ByteArrayOutputStream
 
 class VoiceListener(
     private val onUtterance: (ByteArray) -> Unit,
-    private val onError: (String) -> Unit
+    private val onError: (String) -> Unit,
+    private val onWake: () -> Unit,
+    private val onSleep: () -> Unit
 ) {
     @Volatile var paused = false
+    @Volatile var wake: Recognizer? = null
+    @Volatile private var awakeUntil = 0L
     @Volatile private var running = false
     private var thread: Thread? = null
+    private val wakeWord = Regex("\\bkitt?\\b")
+
+    fun keepAwake(ms: Long) {
+        awakeUntil = System.currentTimeMillis() + ms
+    }
 
     fun start() {
         if (running) return
@@ -66,6 +76,8 @@ class VoiceListener(
         var voiced = 0
         var silent = 0
         var frames = 0
+        var lastAwake = true
+        var wasPaused = false
 
         rec.startRecording()
         try {
@@ -79,8 +91,16 @@ class VoiceListener(
                     pre.clear()
                     voiced = 0
                     silent = 0
+                    wasPaused = true
                     continue
                 }
+
+                val w = wake
+                if (wasPaused) {
+                    wasPaused = false
+                    w?.reset()
+                }
+                val now = System.currentTimeMillis()
 
                 var sum = 0.0
                 for (i in 0 until n) {
@@ -91,12 +111,47 @@ class VoiceListener(
                 val threshold = noise * 2.5 + 250.0
                 val isVoice = rms > threshold
 
+                val awake = w == null || inSpeech || now < awakeUntil
+                if (awake != lastAwake) {
+                    lastAwake = awake
+                    if (!awake) {
+                        w?.reset()
+                        voiced = 0
+                        onSleep()
+                    }
+                }
+
+                // Attesa: ascolta solo la parola "KITT" (offline)
+                if (!awake && w != null) {
+                    if (!isVoice) {
+                        noise = (noise * 0.97 + rms * 0.03).coerceAtLeast(100.0)
+                    }
+                    pre.addLast(buf.copyOf(n))
+                    if (pre.size > 80) pre.removeFirst()
+                    val text = if (w.acceptWaveForm(buf, n)) w.result else w.partialResult
+                    if (wakeWord.containsMatchIn(text)) {
+                        w.reset()
+                        awakeUntil = now + 8000
+                        lastAwake = true
+                        inSpeech = true
+                        silent = 0
+                        voiced = 0
+                        frames = pre.size
+                        speech.reset()
+                        for (f in pre) write(speech, f, f.size)
+                        pre.clear()
+                        onWake()
+                    }
+                    continue
+                }
+
+                // Attivo: registra la frase e la invia
                 if (!inSpeech) {
                     if (!isVoice) {
                         noise = (noise * 0.97 + rms * 0.03).coerceAtLeast(100.0)
                     }
                     pre.addLast(buf.copyOf(n))
-                    if (pre.size > 15) pre.removeFirst()
+                    while (pre.size > 15) pre.removeFirst()
                     if (isVoice) voiced++ else voiced = 0
                     if (voiced >= 4) {
                         inSpeech = true

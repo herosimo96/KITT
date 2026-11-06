@@ -1,15 +1,16 @@
 package com.kitt.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.provider.Settings
 import android.view.Gravity
+import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -18,21 +19,14 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import java.util.Locale
 
-class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+class MainActivity : AppCompatActivity(), KittUi {
     private lateinit var scanner: ScannerView
     private lateinit var hint: TextView
-    private lateinit var brain: Brain
-    private lateinit var commands: Commands
-    private lateinit var voice: VoiceListener
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private var listening = false
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -58,6 +52,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             setTextColor(Color.GRAY)
             gravity = Gravity.CENTER
             setPadding(0, 60, 0, 0)
+            text = KittService.lastStatus
         }
 
         root.addView(title)
@@ -65,25 +60,100 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         root.addView(hint)
         setContentView(root)
 
-        brain = Brain(this)
-        commands = Commands(this)
-        voice = VoiceListener(
-            { pcm -> onUtterance(pcm) },
-            { msg -> setStatus(msg) }
-        )
-        tts = TextToSpeech(this, this)
-
-        if (brain.hasKey()) {
-            hint.text = "Pronto. Tocca per parlare. Tieni premuto per cambiare la chiave"
-        } else {
-            hint.text = "Tieni premuto lo schermo per inserire la chiave Groq"
-        }
-
-        root.setOnClickListener { toggleListening() }
+        root.setOnClickListener { startKitt(KittService.ACTION_WAKE) }
         root.setOnLongClickListener {
             askKey()
             true
         }
+
+        requestPerms()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        KittService.ui = this
+        KittService.appVisible = true
+        KittService.visibilityCallback?.invoke()
+        hint.text = KittService.lastStatus
+    }
+
+    override fun onStop() {
+        if (KittService.ui === this) KittService.ui = null
+        KittService.appVisible = false
+        KittService.visibilityCallback?.invoke()
+        super.onStop()
+    }
+
+    override fun status(text: String) {
+        hint.text = text
+    }
+
+    override fun scan(on: Boolean) {
+        if (on) scanner.start() else scanner.stop()
+    }
+
+    private fun requestPerms() {
+        val list = mutableListOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.SEND_SMS
+        )
+        if (Build.VERSION.SDK_INT >= 33) {
+            list.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val missing = list.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1)
+        } else {
+            afterPermissions()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        afterPermissions()
+    }
+
+    private fun afterPermissions() {
+        startKitt(null)
+        askOverlayOnce()
+    }
+
+    private fun askOverlayOnce() {
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        if (!Settings.canDrawOverlays(this) && !prefs.getBoolean("overlay_asked", false)) {
+            prefs.edit().putBoolean("overlay_asked", true).apply()
+            Toast.makeText(
+                this,
+                "Attiva 'Mostra sopra altre app' per KITT, poi torna indietro",
+                Toast.LENGTH_LONG
+            ).show()
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + packageName)
+                )
+            )
+        }
+    }
+
+    private fun startKitt(action: String?) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            hint.text = "Concedi il permesso del microfono a KITT"
+            return
+        }
+        val i = Intent(this, KittService::class.java)
+        if (action != null) i.action = action
+        ContextCompat.startForegroundService(this, i)
     }
 
     private fun askKey() {
@@ -97,123 +167,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 getSharedPreferences("kitt", MODE_PRIVATE)
                     .edit().putString("groq_key", k).apply()
                 Toast.makeText(this, "Chiave salvata", Toast.LENGTH_SHORT).show()
-                setStatus("Pronto. Tocca per parlare")
+                startKitt(null)
             }
             .setNegativeButton("Annulla", null)
             .show()
-    }
-
-    private fun setStatus(text: String) {
-        runOnUiThread { hint.text = text }
-    }
-
-    private fun resumeListening() {
-        handler.postDelayed({ voice.paused = false }, 500)
-    }
-
-    private fun toggleListening() {
-        if (!brain.hasKey()) {
-            Toast.makeText(this, "Prima inserisci la chiave: tieni premuto lo schermo", Toast.LENGTH_LONG).show()
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-            return
-        }
-        if (listening) {
-            voice.stop()
-            listening = false
-            setStatus("In pausa. Tocca per parlare")
-        } else {
-            voice.paused = false
-            voice.start()
-            listening = true
-            setStatus("Ti ascolto...")
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            toggleListening()
-        }
-    }
-
-    private fun onUtterance(pcm: ByteArray) {
-        voice.paused = true
-        setStatus("Elaboro...")
-        runOnUiThread { scanner.start() }
-        Thread {
-            val (text, error) = brain.transcribe(pcm)
-            if (error.isNotBlank()) {
-                runOnUiThread { scanner.stop() }
-                setStatus(error)
-                resumeListening()
-                return@Thread
-            }
-            if (text.length < 2) {
-                runOnUiThread { scanner.stop() }
-                setStatus("Ti ascolto...")
-                resumeListening()
-                return@Thread
-            }
-            setStatus("Hai detto: $text")
-            val r = brain.think(text)
-            runOnUiThread {
-                val failure = commands.run(r.action, r.arg)
-                val said = failure ?: r.reply
-                setStatus(said)
-                speak(said)
-            }
-        }.start()
-    }
-
-    override fun onInit(status: Int) {
-        if (status != TextToSpeech.SUCCESS) {
-            Toast.makeText(this, "Nessun motore vocale trovato", Toast.LENGTH_LONG).show()
-            return
-        }
-        val result = tts?.setLanguage(Locale.ITALIAN)
-        ttsReady = result != TextToSpeech.LANG_MISSING_DATA &&
-                result != TextToSpeech.LANG_NOT_SUPPORTED
-        if (!ttsReady) {
-            Toast.makeText(this, "Voce italiana non disponibile", Toast.LENGTH_LONG).show()
-        }
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                voice.paused = true
-                runOnUiThread { scanner.start() }
-            }
-            override fun onDone(utteranceId: String?) {
-                runOnUiThread { scanner.stop() }
-                resumeListening()
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                runOnUiThread { scanner.stop() }
-                resumeListening()
-            }
-        })
-    }
-
-    private fun speak(text: String) {
-        if (ttsReady && text.isNotBlank()) {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
-        } else {
-            scanner.stop()
-            resumeListening()
-        }
-    }
-
-    override fun onDestroy() {
-        voice.stop()
-        tts?.shutdown()
-        super.onDestroy()
     }
 }

@@ -8,7 +8,9 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
@@ -106,22 +108,44 @@ class SettingsActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         val accent = KittTheme.scanner(this)
 
+        fun bgGradient(c: Int): GradientDrawable = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(mixColors(c, accent, 0.16f), c)
+        )
+
         val scroll = ScrollView(this)
-        scroll.setBackgroundColor(KittTheme.bg(this))
+        scroll.background = bgGradient(KittTheme.bg(this))
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
-        col.setPadding(dp(20), dp(16), dp(20), dp(32))
+        col.setPadding(dp(18), dp(16), dp(18), dp(32))
         scroll.addView(col)
         setContentView(scroll)
 
-        fun header(t: String) {
+        var cur: LinearLayout = col
+
+        fun card(t: String) {
+            val c = LinearLayout(this)
+            c.orientation = LinearLayout.VERTICAL
+            c.setPadding(dp(16), dp(12), dp(16), dp(16))
+            val g = GradientDrawable()
+            g.setColor(withAlpha(Color.WHITE, 16))
+            g.cornerRadius = dp(18).toFloat()
+            g.setStroke(dp(1), withAlpha(accent, 80))
+            c.background = g
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.topMargin = dp(14)
+            col.addView(c, lp)
+            cur = c
             val h = TextView(this)
             h.text = t
             h.setTextColor(accent)
-            h.textSize = 15f
-            h.typeface = Typeface.MONOSPACE
-            h.setPadding(0, dp(22), 0, dp(6))
-            col.addView(h)
+            h.textSize = 13f
+            h.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            h.letterSpacing = 0.12f
+            h.setPadding(0, 0, 0, dp(8))
+            c.addView(h)
         }
 
         fun body(t: String): TextView {
@@ -129,7 +153,7 @@ class SettingsActivity : AppCompatActivity() {
             b.text = t
             b.setTextColor(Color.LTGRAY)
             b.textSize = 14f
-            col.addView(b)
+            cur.addView(b)
             return b
         }
 
@@ -137,10 +161,13 @@ class SettingsActivity : AppCompatActivity() {
             val b = Button(this)
             b.text = label
             b.isAllCaps = false
+            b.minHeight = 0
+            b.minimumHeight = 0
+            b.setPadding(dp(14), dp(9), dp(14), dp(9))
             b.setTextColor(textColor)
             val g = GradientDrawable()
             g.setColor(fill)
-            g.cornerRadius = dp(10).toFloat()
+            g.cornerRadius = dp(22).toFloat()
             g.setStroke(dp(1), stroke)
             b.background = g
             b.setOnClickListener { onClick() }
@@ -155,7 +182,7 @@ class SettingsActivity : AppCompatActivity() {
                 lp.setMargins(dp(4), dp(4), dp(4), dp(4))
                 r.addView(v, lp)
             }
-            col.addView(r)
+            cur.addView(r)
         }
 
         fun field(hint: String, text: String): EditText {
@@ -166,11 +193,11 @@ class SettingsActivity : AppCompatActivity() {
             e.setHintTextColor(Color.GRAY)
             e.setSingleLine(true)
             val g = GradientDrawable()
-            g.setColor(Color.parseColor("#1A1A1A"))
-            g.cornerRadius = dp(10).toFloat()
-            g.setStroke(dp(1), accent)
+            g.setColor(withAlpha(Color.WHITE, 18))
+            g.cornerRadius = dp(14).toFloat()
+            g.setStroke(dp(1), withAlpha(accent, 130))
             e.background = g
-            e.setPadding(dp(12), dp(10), dp(12), dp(10))
+            e.setPadding(dp(14), dp(10), dp(14), dp(10))
             return e
         }
 
@@ -183,6 +210,8 @@ class SettingsActivity : AppCompatActivity() {
             c.setOnCheckedChangeListener { _, v -> onChange(v) }
             return c
         }
+
+        val dark = withAlpha(Color.WHITE, 16)
 
         // Anteprime
         val scanPreview = ScannerView(this)
@@ -200,7 +229,7 @@ class SettingsActivity : AppCompatActivity() {
         fun applyBg(c: Int) {
             KittTheme.setBg(this, c)
             bgPreview.setBackgroundColor(c)
-            scroll.setBackgroundColor(c)
+            scroll.background = bgGradient(c)
             notifyService()
         }
 
@@ -214,18 +243,19 @@ class SettingsActivity : AppCompatActivity() {
         val titleView = TextView(this)
         titleView.text = "IMPOSTAZIONI"
         titleView.setTextColor(accent)
-        titleView.textSize = 24f
+        titleView.textSize = 22f
         titleView.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        titleView.letterSpacing = 0.1f
         top.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        top.addView(chip("Indietro", accent, Color.parseColor("#1A1A1A"), accent) { finish() })
+        top.addView(chip("Indietro", accent, dark, accent) { finish() })
         col.addView(top)
 
         // Tema
-        header("TEMA")
+        card("TEMA")
         body("Scegli un tema: cambia scanner e sfondo insieme.")
         for (group in KittTheme.presets.chunked(3)) {
             chipRow(group.map { t ->
-                chip(t.name, t.scanner, Color.parseColor("#1A1A1A"), t.scanner) {
+                chip(t.name, t.scanner, dark, t.scanner) {
                     applyScanner(t.scanner)
                     scannerPicker.set(t.scanner)
                     applyBg(t.bg)
@@ -235,14 +265,14 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         // Scanner
-        header("COLORE DELLO SCANNER")
-        col.addView(scanPreview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(34)))
-        col.addView(scannerPicker.view)
+        card("COLORE DELLO SCANNER")
+        cur.addView(scanPreview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(34)))
+        cur.addView(scannerPicker.view)
 
         // Sfondo
-        header("SFONDO")
-        col.addView(bgPreview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(40)))
-        col.addView(bgPicker.view)
+        card("SFONDO")
+        cur.addView(bgPreview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(40)))
+        cur.addView(bgPicker.view)
         val bgOptions = listOf(
             Pair("Nero", "#000000"),
             Pair("Grafite", "#121212"),
@@ -262,7 +292,7 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         // Nome e saluto
-        header("TU E KITT")
+        card("TU E KITT")
         body("Come ti deve chiamare KITT?")
         val nameField = field("Il tuo nome", KittTheme.userName(this))
         nameField.addTextChangedListener(object : TextWatcher {
@@ -272,24 +302,24 @@ class SettingsActivity : AppCompatActivity() {
                 KittTheme.setUserName(this@SettingsActivity, s.toString().trim())
             }
         })
-        col.addView(nameField)
-        col.addView(checkbox("Saluto di benvenuto all'avvio", KittTheme.greet(this)) {
+        cur.addView(nameField)
+        cur.addView(checkbox("Saluto di benvenuto all'avvio", KittTheme.greet(this)) {
             KittTheme.setGreet(this, it)
         })
-        col.addView(checkbox("KITT risponde a voce anche quando scrivo", KittTheme.speakTyped(this)) {
+        cur.addView(checkbox("KITT risponde a voce anche quando scrivo", KittTheme.speakTyped(this)) {
             KittTheme.setSpeakTyped(this, it)
         })
 
         // Chiave Groq
-        header("CHIAVE GROQ")
+        card("CHIAVE GROQ")
         val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
         val hasKey = !prefs.getString("groq_key", "").isNullOrBlank()
         val keyField = field(
             if (hasKey) "Chiave già salvata: incolla per cambiarla" else "Incolla qui la chiave Groq",
             ""
         )
-        col.addView(keyField)
-        col.addView(chip("Salva chiave", accent, Color.parseColor("#1A1A1A"), accent) {
+        cur.addView(keyField)
+        cur.addView(chip("Salva chiave", accent, dark, accent) {
             val k = keyField.text.toString().trim()
             if (k.isNotEmpty()) {
                 prefs.edit().putString("groq_key", k).apply()
@@ -299,16 +329,36 @@ class SettingsActivity : AppCompatActivity() {
             }
         })
 
+        // Funzionamento in background
+        card("FUNZIONAMENTO IN BACKGROUND")
+        body("Se KITT smette di rispondere dopo un po', consenti all'app di restare attiva. Su molti stereo serve anche un'impostazione dello stereo stesso: cerca KITT in Avvio automatico, Gestione app o Risparmio energetico e consentilo.")
+        cur.addView(chip("Non limitare KITT (risparmio energetico)", accent, dark, accent) {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + packageName)
+                    )
+                )
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this,
+                    "Non disponibile su questo dispositivo: cerca KITT in Impostazioni > App > Batteria",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        })
+
         // Voce
-        header("VOCE")
+        card("VOCE")
         body("Se non senti KITT parlare, premi più volte: ogni tocco prova un canale audio diverso e KITT lo annuncia. Quando lo senti, fermati: resta salvato.")
-        col.addView(chip("Prova voce / cambia canale", accent, Color.parseColor("#1A1A1A"), accent) {
+        cur.addView(chip("Prova voce / cambia canale", accent, dark, accent) {
             launchKitt(KittService.ACTION_TEST)
         })
 
         // Crediti
         val credit = TextView(this)
-        credit.text = "K.I.T.T. v1.0\nSviluppato da\nSimone Campanale Nik (Herosimo96)"
+        credit.text = "K.I.T.T. v1.1\nSviluppato da\nSimone Campanale Nik (Herosimo96)"
         credit.setTextColor(accent)
         credit.textSize = 16f
         credit.typeface = Typeface.MONOSPACE

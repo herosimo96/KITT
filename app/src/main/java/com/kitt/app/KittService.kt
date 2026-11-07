@@ -1,6 +1,7 @@
 package com.kitt.app
 
 import android.Manifest
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,14 +11,18 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -79,17 +84,54 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private var greetText: String? = null
 
     private var voiceStarted = false
+    private var busySince = 0L
     private var busy = false
+        set(value) {
+            field = value
+            if (value) busySince = System.currentTimeMillis()
+        }
+    private var userPaused = false
+    private var stoppedByUser = false
+    private var watchdogStarted = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var wakeModel: Model? = null
     private var wakeError = ""
 
     private var bubble: LinearLayout? = null
     private var bubbleScanner: ScannerView? = null
     private var bubbleBg: GradientDrawable? = null
+    private var bubblePause: TextView? = null
+    private var bubbleClose: TextView? = null
+    private var controlsVisible = false
     private var bubbleX = 0
     private var bubbleY = 0
     private var dismissed = false
     private var serviceActive = false
+
+    private val hideControls = Runnable {
+        controlsVisible = false
+        refreshBubble()
+    }
+
+    private val speakGuard = Runnable {
+        if (busy) {
+            busy = false
+            abandonFocus()
+            scan(false)
+            resumeListening()
+        }
+    }
+
+    private val watchdog = object : Runnable {
+        override fun run() {
+            try {
+                checkHealth()
+            } catch (e: Exception) {
+            }
+            handler.postDelayed(this, 20000)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -102,7 +144,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         brain = Brain(this)
         commands = Commands(this)
         voice = VoiceListener(
-            { pcm -> onUtterance(pcm) },
+            { pcm, fromWake -> onUtterance(pcm, fromWake) },
             { msg -> setStatus(msg) },
             { onWake() },
             { onSleep() }
@@ -114,7 +156,9 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_STOP) {
+            stoppedByUser = true
             serviceActive = false
+            handler.removeCallbacks(watchdog)
             removeBubble()
             setStatus("KITT spento")
             stopForeground(true)
@@ -128,13 +172,16 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             stopSelf()
             return START_NOT_STICKY
         }
+        stoppedByUser = false
         serviceActive = true
+        acquireLocks()
+        if (!watchdogStarted) {
+            watchdogStarted = true
+            handler.postDelayed(watchdog, 20000)
+        }
         updateBubble()
         when (action) {
-            ACTION_WAKE -> {
-                voice.keepAwake(10000)
-                onWake()
-            }
+            ACTION_WAKE -> resumeKitt()
             ACTION_TEST -> testVoice()
             ACTION_TEXT -> {
                 val t = intent?.getStringExtra(EXTRA_TEXT)
@@ -145,6 +192,21 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }
         begin()
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (!stoppedByUser) {
+            try {
+                val am = getSystemService(ALARM_SERVICE) as AlarmManager
+                val pi = PendingIntent.getForegroundService(
+                    this, 2, Intent(this, KittService::class.java),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                am.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 2000, pi)
+            } catch (e: Exception) {
+            }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun startInForeground() {
@@ -160,7 +222,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         )
         val n = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle("K.I.T.T. attivo")
-            .setContentText("Di' \"Hey KITT\" per parlare")
+            .setContentText("Di' \"Ciao KITT\" per parlare")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(open)
             .addAction(0, "Spegni", stop)
@@ -170,6 +232,61 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(NOTIF_ID, n)
+        }
+    }
+
+    // ---------- tenere KITT sveglio ----------
+
+    private fun acquireLocks() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(POWER_SERVICE) as PowerManager
+                val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kitt:listen")
+                wl.setReferenceCounted(false)
+                wakeLock = wl
+            }
+            if (wakeLock?.isHeld != true) wakeLock?.acquire()
+        } catch (e: Exception) {
+        }
+        try {
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                val wl = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "kitt:wifi")
+                wl.setReferenceCounted(false)
+                wifiLock = wl
+            }
+            if (wifiLock?.isHeld != true) wifiLock?.acquire()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (e: Exception) {
+        }
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun checkHealth() {
+        if (!serviceActive) return
+        acquireLocks()
+        val now = System.currentTimeMillis()
+        if (busy && now - busySince > 45000) {
+            busy = false
+            abandonFocus()
+            scan(false)
+            resumeListening()
+        }
+        if (!busy && voice.paused) {
+            voice.paused = false
+        }
+        if (voiceStarted && !voice.isAlive()) {
+            voice.start()
+            setStatus(idleStatus())
         }
     }
 
@@ -185,7 +302,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private fun idleStatus(): String =
         if (!voiceStarted) "Pronto"
-        else if (voice.wake != null) "In attesa: di' \"Hey KITT\""
+        else if (userPaused) "In pausa. Di' \"Ciao KITT\" o tocca PLAY"
+        else if (voice.wake != null) "In attesa: di' \"Ciao KITT\""
         else "Ti ascolto..."
 
     private fun handleText(text: String) {
@@ -197,17 +315,23 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         setStatus("KITT sta pensando...")
         scan(true)
         Thread {
-            val r = brain.think(text)
-            handler.post {
-                val failure = commands.run(r.action, r.arg)
-                val said = failure ?: r.reply
-                if (said.isNotBlank()) addChat(false, said)
-                if (KittTheme.speakTyped(this) && ttsReady && said.isNotBlank()) {
-                    busy = true
-                    speak(said)
-                } else {
+            try {
+                val r = brain.think(text)
+                handler.post {
+                    val failure = commands.run(r.action, r.arg)
+                    val said = failure ?: r.reply
+                    if (said.isNotBlank()) addChat(false, said)
+                    if (KittTheme.speakTyped(this) && ttsReady && said.isNotBlank()) {
+                        speak(said)
+                    } else {
+                        scan(false)
+                        setStatus(idleStatus())
+                    }
+                }
+            } catch (e: Exception) {
+                handler.post {
                     scan(false)
-                    setStatus(idleStatus())
+                    setStatus("Errore: " + e.message)
                 }
             }
         }.start()
@@ -234,8 +358,37 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         val g = greetText ?: return
         if (!ttsReady) return
         greetText = null
-        busy = true
         speak(g)
+    }
+
+    // ---------- pausa e ripresa ----------
+
+    private fun pauseKitt() {
+        userPaused = true
+        handler.removeCallbacks(speakGuard)
+        try {
+            tts?.stop()
+        } catch (e: Exception) {
+        }
+        abandonFocus()
+        busy = false
+        voice.keepAwake(0)
+        voice.paused = false
+        setStatus("In pausa. Di' \"Ciao KITT\" o tocca PLAY per riattivarmi")
+        handler.post {
+            refreshBubble()
+            bubbleScannerState()
+        }
+    }
+
+    private fun resumeKitt() {
+        userPaused = false
+        voice.keepAwake(10000)
+        handler.post {
+            refreshBubble()
+            bubbleScannerState()
+        }
+        onWake()
     }
 
     // ---------- bolla sullo schermo ----------
@@ -244,17 +397,31 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         val should = serviceActive && !dismissed && !appVisible && Settings.canDrawOverlays(this)
         if (should) showBubble() else removeBubble()
         applyBubbleTheme()
+        refreshBubble()
     }
 
     private fun applyBubbleTheme() {
         val c = KittTheme.scanner(this)
         bubbleScanner?.color = c
         bubbleBg?.setStroke(dp(1), c)
+        bubblePause?.setTextColor(c)
+    }
+
+    private fun refreshBubble() {
+        bubblePause?.text = if (userPaused) "PLAY" else "STOP"
+        bubblePause?.visibility = if (controlsVisible || userPaused) View.VISIBLE else View.GONE
+        bubbleClose?.visibility = if (controlsVisible) View.VISIBLE else View.GONE
+    }
+
+    private fun bubbleScannerState() {
+        val s = bubbleScanner ?: return
+        if (userPaused) s.stop() else s.start(if (busy) 700L else 2800L)
     }
 
     private fun showBubble() {
         if (bubble != null) return
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val accent = KittTheme.scanner(this)
 
         val box = LinearLayout(this)
         box.orientation = LinearLayout.HORIZONTAL
@@ -262,25 +429,40 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         box.setPadding(dp(10), dp(8), dp(10), dp(8))
         val bg = GradientDrawable()
         bg.setColor(Color.parseColor("#E6000000"))
-        bg.cornerRadius = dp(14).toFloat()
-        bg.setStroke(dp(1), KittTheme.scanner(this))
+        bg.cornerRadius = dp(16).toFloat()
+        bg.setStroke(dp(1), accent)
         box.background = bg
 
         val sc = ScannerView(this)
-        sc.color = KittTheme.scanner(this)
-        box.addView(sc, LinearLayout.LayoutParams(dp(130), dp(22)))
+        sc.color = accent
+        box.addView(sc, LinearLayout.LayoutParams(dp(120), dp(22)))
+
+        val pauseBtn = TextView(this)
+        pauseBtn.text = "STOP"
+        pauseBtn.setTextColor(accent)
+        pauseBtn.textSize = 12f
+        pauseBtn.typeface = Typeface.DEFAULT_BOLD
+        pauseBtn.setPadding(dp(14), dp(6), dp(6), dp(6))
+        pauseBtn.visibility = View.GONE
+        box.addView(pauseBtn)
+        pauseBtn.setOnClickListener {
+            if (userPaused) resumeKitt() else pauseKitt()
+            handler.removeCallbacks(hideControls)
+            handler.postDelayed(hideControls, 4000)
+        }
 
         val close = TextView(this)
         close.text = "✕"
         close.setTextColor(Color.WHITE)
         close.textSize = 18f
-        close.setPadding(dp(12), 0, dp(4), 0)
+        close.setPadding(dp(10), 0, dp(4), 0)
         close.visibility = View.GONE
         box.addView(close)
         close.setOnClickListener {
             dismissed = true
+            controlsVisible = false
             updateBubble()
-            setStatus("Bolla chiusa. Di' \"Hey KITT\" per riaprirla")
+            setStatus("Bolla chiusa. Di' \"Ciao KITT\" per riaprirla")
         }
 
         val lp = WindowManager.LayoutParams(
@@ -328,12 +510,10 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!moved) {
-                        if (close.visibility == View.VISIBLE) {
-                            close.visibility = View.GONE
-                        } else {
-                            close.visibility = View.VISIBLE
-                            handler.postDelayed({ close.visibility = View.GONE }, 4000)
-                        }
+                        controlsVisible = !controlsVisible
+                        refreshBubble()
+                        handler.removeCallbacks(hideControls)
+                        if (controlsVisible) handler.postDelayed(hideControls, 4000)
                     }
                     true
                 }
@@ -346,11 +526,15 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             bubble = box
             bubbleScanner = sc
             bubbleBg = bg
-            sc.start(2800L)
+            bubblePause = pauseBtn
+            bubbleClose = close
+            bubbleScannerState()
         } catch (e: Exception) {
             bubble = null
             bubbleScanner = null
             bubbleBg = null
+            bubblePause = null
+            bubbleClose = null
         }
     }
 
@@ -364,6 +548,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         bubble = null
         bubbleScanner = null
         bubbleBg = null
+        bubblePause = null
+        bubbleClose = null
     }
 
     // ---------- stato e scanner ----------
@@ -377,7 +563,10 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private fun scan(on: Boolean) {
         handler.post {
             ui?.scan(on)
-            bubbleScanner?.start(if (on) 700L else 2800L)
+            val s = bubbleScanner
+            if (s != null) {
+                if (on) s.start(700L) else if (userPaused) s.stop() else s.start(2800L)
+            }
         }
     }
 
@@ -402,7 +591,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             voice.paused = false
             voice.start()
             if (voice.wake != null) {
-                setStatus("In attesa: di' \"Hey KITT\"")
+                setStatus("In attesa: di' \"Ciao KITT\"")
             } else {
                 setStatus("Ascolto sempre attivo. " + wakeError)
             }
@@ -414,7 +603,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         val okFile = File(filesDir, "wake/ok")
         try {
             if (!okFile.exists()) {
-                setStatus("Scarico il modello per 'Hey KITT' (circa 40 MB), attendi...")
+                setStatus("Scarico il modello per 'Ciao KITT' (circa 40 MB), attendi...")
                 File(filesDir, "wake").deleteRecursively()
                 val url = URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
                 val conn = url.openConnection()
@@ -444,6 +633,13 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun onWake() {
+        if (userPaused) {
+            userPaused = false
+            handler.post {
+                refreshBubble()
+                bubbleScannerState()
+            }
+        }
         setStatus("Ti ascolto...")
         handler.post {
             dismissed = false
@@ -454,12 +650,12 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun onSleep() {
-        setStatus("In attesa: di' \"Hey KITT\"")
+        setStatus(idleStatus())
     }
 
     private fun resumeListening() {
         handler.postDelayed({
-            voice.keepAwake(10000)
+            if (!userPaused) voice.keepAwake(10000)
             voice.paused = false
         }, 500)
     }
@@ -471,30 +667,58 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         resumeListening()
     }
 
-    private fun onUtterance(pcm: ByteArray) {
+    private fun falseAlarm() {
+        busy = false
+        scan(false)
+        setStatus(idleStatus())
+        handler.postDelayed({
+            voice.keepAwake(0)
+            voice.paused = false
+        }, 300)
+    }
+
+    private fun looksLikeWake(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf("kit", "chit", "ciao", "buongiorno", "buonasera", "hey", "ehi").any { t.contains(it) }
+    }
+
+    private fun onUtterance(pcm: ByteArray, fromWake: Boolean) {
         busy = true
         voice.paused = true
         setStatus("Elaboro...")
         scan(true)
         Thread {
-            val (text, error) = brain.transcribe(pcm)
-            if (error.isNotBlank()) {
-                finish(error)
-                return@Thread
-            }
-            if (text.length < 2 || text.contains("assistente vocale dell", ignoreCase = true)) {
-                finish(null)
-                return@Thread
-            }
-            addChat(true, text)
-            setStatus("Hai detto: $text")
-            val r = brain.think(text)
-            handler.post {
-                val failure = commands.run(r.action, r.arg)
-                val said = failure ?: r.reply
-                setStatus(said)
-                if (said.isNotBlank()) addChat(false, said)
-                speak(said)
+            try {
+                val (text, error) = brain.transcribe(pcm)
+                if (error.isNotBlank()) {
+                    finish(error)
+                    return@Thread
+                }
+                if (text.length < 2 || text.contains("assistente vocale dell", ignoreCase = true)) {
+                    if (fromWake) falseAlarm() else finish(null)
+                    return@Thread
+                }
+                if (fromWake && !looksLikeWake(text)) {
+                    falseAlarm()
+                    return@Thread
+                }
+                addChat(true, text)
+                setStatus("Hai detto: $text")
+                val r = brain.think(text)
+                handler.post {
+                    if (userPaused) {
+                        busy = false
+                        scan(false)
+                        return@post
+                    }
+                    val failure = commands.run(r.action, r.arg)
+                    val said = failure ?: r.reply
+                    setStatus(said)
+                    if (said.isNotBlank()) addChat(false, said)
+                    speak(said)
+                }
+            } catch (e: Exception) {
+                finish("Errore: " + e.message)
             }
         }.start()
     }
@@ -600,6 +824,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 scan(true)
             }
             override fun onDone(utteranceId: String?) {
+                handler.removeCallbacks(speakGuard)
                 abandonFocus()
                 busy = false
                 scan(false)
@@ -607,6 +832,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             }
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
+                handler.removeCallbacks(speakGuard)
                 abandonFocus()
                 busy = false
                 scan(false)
@@ -635,10 +861,13 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private fun speak(text: String) {
         if (ttsReady && text.isNotBlank()) {
+            busy = true
             val a = attrs(route())
             tts?.setAudioAttributes(a)
             requestFocus(a)
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
+            handler.removeCallbacks(speakGuard)
+            handler.postDelayed(speakGuard, 8000L + text.length * 100L)
         } else {
             busy = false
             scan(false)
@@ -647,9 +876,13 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(watchdog)
+        handler.removeCallbacks(speakGuard)
+        handler.removeCallbacks(hideControls)
         visibilityCallback = null
         removeBubble()
         abandonFocus()
+        releaseLocks()
         voice.stop()
         try {
             voice.wake?.close()

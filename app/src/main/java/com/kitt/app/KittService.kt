@@ -40,6 +40,7 @@ import java.util.zip.ZipInputStream
 interface KittUi {
     fun status(text: String)
     fun scan(on: Boolean)
+    fun message(fromUser: Boolean, text: String)
 }
 
 class KittService : Service(), TextToSpeech.OnInitListener {
@@ -48,9 +49,14 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         @Volatile var lastStatus: String = "Avvio..."
         @Volatile var appVisible = false
         @Volatile var visibilityCallback: (() -> Unit)? = null
+        val chat: MutableList<Pair<Boolean, String>> =
+            java.util.Collections.synchronizedList(ArrayList<Pair<Boolean, String>>())
         const val ACTION_STOP = "com.kitt.app.STOP"
         const val ACTION_WAKE = "com.kitt.app.WAKE"
         const val ACTION_TEST = "com.kitt.app.TEST"
+        const val ACTION_BOOT = "com.kitt.app.BOOT"
+        const val ACTION_TEXT = "com.kitt.app.TEXT"
+        const val EXTRA_TEXT = "text"
         private const val CHANNEL = "kitt"
         private const val NOTIF_ID = 1
         private const val ESPEAK = "com.reecedunn.espeak"
@@ -70,6 +76,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private val ttsLog = StringBuilder()
     private var focusRequest: AudioFocusRequest? = null
     private val routeNames = listOf("media", "navigazione", "assistente", "notifica", "sveglia", "chiamata")
+    private var greetText: String? = null
 
     private var voiceStarted = false
     private var busy = false
@@ -78,6 +85,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private var bubble: LinearLayout? = null
     private var bubbleScanner: ScannerView? = null
+    private var bubbleBg: GradientDrawable? = null
     private var bubbleX = 0
     private var bubbleY = 0
     private var dismissed = false
@@ -104,7 +112,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        val action = intent?.action
+        if (action == ACTION_STOP) {
             serviceActive = false
             removeBubble()
             setStatus("KITT spento")
@@ -121,12 +130,18 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }
         serviceActive = true
         updateBubble()
-        if (intent?.action == ACTION_WAKE) {
-            voice.keepAwake(10000)
-            onWake()
-        }
-        if (intent?.action == ACTION_TEST) {
-            testVoice()
+        when (action) {
+            ACTION_WAKE -> {
+                voice.keepAwake(10000)
+                onWake()
+            }
+            ACTION_TEST -> testVoice()
+            ACTION_TEXT -> {
+                val t = intent?.getStringExtra(EXTRA_TEXT)
+                if (!t.isNullOrBlank()) handleText(t)
+            }
+            ACTION_BOOT -> maybeGreet(true)
+            else -> maybeGreet(false)
         }
         begin()
         return START_STICKY
@@ -158,11 +173,83 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // ---------- chat ----------
+
+    private fun addChat(fromUser: Boolean, text: String) {
+        synchronized(chat) {
+            chat.add(Pair(fromUser, text))
+            while (chat.size > 200) chat.removeAt(0)
+        }
+        handler.post { ui?.message(fromUser, text) }
+    }
+
+    private fun idleStatus(): String =
+        if (!voiceStarted) "Pronto"
+        else if (voice.wake != null) "In attesa: di' \"Hey KITT\""
+        else "Ti ascolto..."
+
+    private fun handleText(text: String) {
+        addChat(true, text)
+        if (!brain.hasKey()) {
+            addChat(false, "Manca la chiave Groq: inseriscila in Impostazioni.")
+            return
+        }
+        setStatus("KITT sta pensando...")
+        scan(true)
+        Thread {
+            val r = brain.think(text)
+            handler.post {
+                val failure = commands.run(r.action, r.arg)
+                val said = failure ?: r.reply
+                if (said.isNotBlank()) addChat(false, said)
+                if (KittTheme.speakTyped(this) && ttsReady && said.isNotBlank()) {
+                    busy = true
+                    speak(said)
+                } else {
+                    scan(false)
+                    setStatus(idleStatus())
+                }
+            }
+        }.start()
+    }
+
+    // ---------- saluto di benvenuto ----------
+
+    private fun maybeGreet(force: Boolean) {
+        if (!KittTheme.greet(this)) return
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        val last = prefs.getLong("last_greet", 0L)
+        val now = System.currentTimeMillis()
+        if (!force && now - last < 6 * 3600 * 1000L) return
+        prefs.edit().putLong("last_greet", now).apply()
+        val text = "Ciao " + KittTheme.userName(this) + ", benvenuto a bordo."
+        dismissed = false
+        updateBubble()
+        addChat(false, text)
+        greetText = text
+        trySpeakGreeting()
+    }
+
+    private fun trySpeakGreeting() {
+        val g = greetText ?: return
+        if (!ttsReady) return
+        greetText = null
+        busy = true
+        speak(g)
+    }
+
     // ---------- bolla sullo schermo ----------
 
     private fun updateBubble() {
         val should = serviceActive && !dismissed && !appVisible && Settings.canDrawOverlays(this)
         if (should) showBubble() else removeBubble()
+        applyBubbleTheme()
+    }
+
+    private fun applyBubbleTheme() {
+        val c = KittTheme.scanner(this)
+        bubbleScanner?.color = c
+        bubbleBg?.setStroke(dp(1), c)
     }
 
     private fun showBubble() {
@@ -176,10 +263,11 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         val bg = GradientDrawable()
         bg.setColor(Color.parseColor("#E6000000"))
         bg.cornerRadius = dp(14).toFloat()
-        bg.setStroke(dp(1), Color.parseColor("#B00000"))
+        bg.setStroke(dp(1), KittTheme.scanner(this))
         box.background = bg
 
         val sc = ScannerView(this)
+        sc.color = KittTheme.scanner(this)
         box.addView(sc, LinearLayout.LayoutParams(dp(130), dp(22)))
 
         val close = TextView(this)
@@ -257,10 +345,12 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             wm.addView(box, lp)
             bubble = box
             bubbleScanner = sc
+            bubbleBg = bg
             sc.start(2800L)
         } catch (e: Exception) {
             bubble = null
             bubbleScanner = null
+            bubbleBg = null
         }
     }
 
@@ -273,6 +363,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }
         bubble = null
         bubbleScanner = null
+        bubbleBg = null
     }
 
     // ---------- stato e scanner ----------
@@ -295,7 +386,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private fun begin() {
         if (voiceStarted) return
         if (!brain.hasKey()) {
-            setStatus("Tieni premuto lo schermo per inserire la chiave Groq")
+            setStatus("Apri Impostazioni e inserisci la chiave Groq")
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -395,12 +486,14 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 finish(null)
                 return@Thread
             }
+            addChat(true, text)
             setStatus("Hai detto: $text")
             val r = brain.think(text)
             handler.post {
                 val failure = commands.run(r.action, r.arg)
                 val said = failure ?: r.reply
                 setStatus(said)
+                if (said.isNotBlank()) addChat(false, said)
                 speak(said)
             }
         }.start()
@@ -456,7 +549,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         setStatus(
             "Canale voce: " + routeNames[next] + " (volume media " + vol + "/" + max +
-                    "). Se non senti nulla, tocca di nuovo la scritta K.I.T.T."
+                    "). Per cambiare canale premi di nuovo Prova voce in Impostazioni."
         )
         speak("Prova voce, canale " + routeNames[next])
     }
@@ -520,7 +613,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 resumeListening()
             }
         })
-        setStatus("Voce pronta (" + name + "). Tocca la scritta K.I.T.T. per provare i canali audio")
+        setStatus("Voce pronta (" + name + ")")
+        trySpeakGreeting()
     }
 
     private fun nextEngine() {

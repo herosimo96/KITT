@@ -55,6 +55,8 @@ class MainActivity : AppCompatActivity(), KittUi {
             text = KittService.lastStatus
         }
 
+        title.setOnClickListener { startKitt(KittService.ACTION_TEST) }
+
         root.addView(title)
         root.addView(scanner, scannerParams)
         root.addView(hint)

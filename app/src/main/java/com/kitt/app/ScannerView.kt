@@ -15,6 +15,12 @@ class ScannerView(context: Context) : View(context) {
     private var animator: ValueAnimator? = null
     private var currentDuration = 0L
 
+    var color: Int = Color.RED
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     fun start(durationMs: Long = 900L) {
         if (animator?.isRunning == true && currentDuration == durationMs) return
         animator?.cancel()
@@ -53,7 +59,10 @@ class ScannerView(context: Context) : View(context) {
         for (i in 0 until segments) {
             val dist = Math.abs(i - center)
             val level = (1f - dist / 6f).coerceIn(0.08f, 1f)
-            paint.color = Color.argb((255 * level).toInt(), 255, 20, 20)
+            paint.color = Color.argb(
+                (255 * level).toInt(),
+                Color.red(color), Color.green(color), Color.blue(color)
+            )
             val left = i * (segW + gap)
             canvas.drawRoundRect(left, 0f, left + segW, h, 8f, 8f, paint)
         }

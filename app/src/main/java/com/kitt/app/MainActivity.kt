@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -32,6 +33,7 @@ class MainActivity : AppCompatActivity(), KittUi {
 
     private lateinit var root: FrameLayout
     private lateinit var titleView: TextView
+    private lateinit var scannerCard: LinearLayout
     private lateinit var scanner: ScannerView
     private lateinit var hint: TextView
     private lateinit var chatScroll: ScrollView
@@ -57,39 +59,56 @@ class MainActivity : AppCompatActivity(), KittUi {
 
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
-        content.setPadding(dp(16), dp(10), dp(16), dp(10))
+        content.setPadding(dp(18), dp(14), dp(18), dp(12))
 
         // Intestazione
         val top = LinearLayout(this)
         top.orientation = LinearLayout.HORIZONTAL
         top.gravity = Gravity.CENTER_VERTICAL
+        val titles = LinearLayout(this)
+        titles.orientation = LinearLayout.VERTICAL
         titleView = TextView(this)
         titleView.text = "K.I.T.T."
-        titleView.textSize = 30f
+        titleView.textSize = 28f
         titleView.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        titleView.letterSpacing = 0.12f
+        val subtitle = TextView(this)
+        subtitle.text = "KNIGHT INDUSTRIES TWO THOUSAND"
+        subtitle.textSize = 10f
+        subtitle.setTextColor(Color.GRAY)
+        subtitle.letterSpacing = 0.18f
+        titles.addView(titleView)
+        titles.addView(subtitle)
         settingsBtn = Button(this)
         settingsBtn.text = "Impostazioni"
         settingsBtn.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
-        top.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        top.addView(titles, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         top.addView(settingsBtn)
         content.addView(top)
 
-        // Scanner e stato
+        // Scanner in una scheda
+        scannerCard = LinearLayout(this)
+        scannerCard.setPadding(dp(14), dp(14), dp(14), dp(14))
         scanner = ScannerView(this)
-        val sp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(32))
-        sp.topMargin = dp(8)
-        content.addView(scanner, sp)
-
-        hint = TextView(this)
-        hint.textSize = 13f
-        hint.setTextColor(Color.GRAY)
-        hint.maxLines = 3
-        val hp = LinearLayout.LayoutParams(
+        scannerCard.addView(scanner, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(30)))
+        val scp = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         )
-        hp.topMargin = dp(6)
+        scp.topMargin = dp(14)
+        content.addView(scannerCard, scp)
+
+        // Stato
+        hint = TextView(this)
+        hint.textSize = 12f
+        hint.setTextColor(Color.LTGRAY)
+        hint.maxLines = 3
+        hint.setPadding(dp(12), dp(7), dp(12), dp(7))
+        val hp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        hp.topMargin = dp(10)
         content.addView(hint, hp)
 
         // Chat
@@ -111,7 +130,7 @@ class MainActivity : AppCompatActivity(), KittUi {
         input.setHintTextColor(Color.GRAY)
         input.setSingleLine(true)
         input.imeOptions = EditorInfo.IME_ACTION_SEND
-        input.setPadding(dp(14), dp(10), dp(14), dp(10))
+        input.setPadding(dp(18), dp(11), dp(18), dp(11))
         input.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEND) {
                 sendTyped()
@@ -127,12 +146,16 @@ class MainActivity : AppCompatActivity(), KittUi {
         sendBtn.text = "Invia"
         sendBtn.setOnClickListener { sendTyped() }
         inputRow.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        inputRow.addView(micBtn)
-        inputRow.addView(sendBtn)
+        val bp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        bp.leftMargin = dp(8)
+        inputRow.addView(micBtn, bp)
+        inputRow.addView(sendBtn, bp)
         val ip = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         )
-        ip.topMargin = dp(8)
+        ip.topMargin = dp(10)
         content.addView(inputRow, ip)
 
         root.addView(
@@ -147,12 +170,14 @@ class MainActivity : AppCompatActivity(), KittUi {
         introTitle = TextView(this)
         introTitle.textSize = 48f
         introTitle.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        introTitle.letterSpacing = 0.12f
         introTitle.gravity = Gravity.CENTER
         introScanner = ScannerView(this)
         introSub = TextView(this)
         introSub.text = "KNIGHT INDUSTRIES TWO THOUSAND"
-        introSub.textSize = 13f
+        introSub.textSize = 12f
         introSub.typeface = Typeface.MONOSPACE
+        introSub.letterSpacing = 0.18f
         introSub.setTextColor(Color.GRAY)
         introSub.gravity = Gravity.CENTER
         introSub.alpha = 0f
@@ -199,14 +224,17 @@ class MainActivity : AppCompatActivity(), KittUi {
 
     private fun styleButton(b: Button, accent: Int, filled: Boolean) {
         b.isAllCaps = false
+        b.minHeight = 0
+        b.minimumHeight = 0
+        b.setPadding(dp(16), dp(9), dp(16), dp(9))
         val g = GradientDrawable()
-        g.cornerRadius = dp(10).toFloat()
+        g.cornerRadius = dp(22).toFloat()
         g.setStroke(dp(1), accent)
         if (filled) {
             g.setColor(accent)
             b.setTextColor(Color.BLACK)
         } else {
-            g.setColor(Color.parseColor("#1A1A1A"))
+            g.setColor(withAlpha(Color.WHITE, 16))
             b.setTextColor(accent)
         }
         b.background = g
@@ -215,19 +243,35 @@ class MainActivity : AppCompatActivity(), KittUi {
     private fun applyTheme() {
         val accent = KittTheme.scanner(this)
         val bg = KittTheme.bg(this)
-        root.setBackgroundColor(bg)
+        root.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(mixColors(bg, accent, 0.16f), bg)
+        )
         intro.setBackgroundColor(bg)
         titleView.setTextColor(accent)
         introTitle.setTextColor(accent)
         scanner.color = accent
         introScanner.color = accent
+
+        val card = GradientDrawable()
+        card.setColor(mixColors(bg, Color.WHITE, 0.05f))
+        card.cornerRadius = dp(18).toFloat()
+        card.setStroke(dp(1), withAlpha(accent, 120))
+        scannerCard.background = card
+
+        val pill = GradientDrawable()
+        pill.setColor(withAlpha(Color.WHITE, 18))
+        pill.cornerRadius = dp(14).toFloat()
+        hint.background = pill
+
         styleButton(settingsBtn, accent, false)
         styleButton(micBtn, accent, false)
         styleButton(sendBtn, accent, true)
+
         val g = GradientDrawable()
-        g.setColor(Color.parseColor("#1A1A1A"))
-        g.cornerRadius = dp(10).toFloat()
-        g.setStroke(dp(1), accent)
+        g.setColor(withAlpha(Color.WHITE, 18))
+        g.cornerRadius = dp(24).toFloat()
+        g.setStroke(dp(1), withAlpha(accent, 130))
         input.background = g
         renderChat()
     }
@@ -264,25 +308,29 @@ class MainActivity : AppCompatActivity(), KittUi {
     // ---------- chat ----------
 
     private fun bubbleView(fromUser: Boolean, text: String): View {
+        val accent = KittTheme.scanner(this)
         val tv = TextView(this)
         tv.text = text
         tv.textSize = 16f
         tv.setTextColor(Color.WHITE)
-        tv.setPadding(dp(14), dp(10), dp(14), dp(10))
+        tv.setPadding(dp(16), dp(11), dp(16), dp(11))
         tv.maxWidth = (resources.displayMetrics.widthPixels * 0.78).toInt()
         val g = GradientDrawable()
-        g.cornerRadius = dp(16).toFloat()
+        val r = dp(18).toFloat()
+        val s = dp(4).toFloat()
         if (fromUser) {
-            g.setColor(Color.parseColor("#2A2A2A"))
+            g.setColor(withAlpha(accent, 70))
+            g.cornerRadii = floatArrayOf(r, r, r, r, s, s, r, r)
         } else {
-            g.setColor(Color.parseColor("#0D0D0D"))
-            g.setStroke(dp(1), KittTheme.scanner(this))
+            g.setColor(withAlpha(Color.WHITE, 20))
+            g.setStroke(dp(1), withAlpha(accent, 150))
+            g.cornerRadii = floatArrayOf(s, s, r, r, r, r, r, r)
         }
         tv.background = g
         val lp = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
         )
-        lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+        lp.setMargins(dp(4), dp(5), dp(4), dp(5))
         lp.gravity = if (fromUser) Gravity.END else Gravity.START
         tv.layoutParams = lp
         return tv
@@ -293,7 +341,7 @@ class MainActivity : AppCompatActivity(), KittUi {
         val copy = synchronized(KittService.chat) { ArrayList(KittService.chat) }
         if (copy.isEmpty()) {
             val t = TextView(this)
-            t.text = "Scrivimi qui sotto oppure di' \"Hey KITT\"."
+            t.text = "Scrivimi qui sotto oppure di' \"Ciao KITT\"."
             t.setTextColor(Color.GRAY)
             t.setPadding(dp(4), dp(8), dp(4), dp(8))
             chatBox.addView(t)
@@ -374,10 +422,10 @@ class MainActivity : AppCompatActivity(), KittUi {
 
     private fun afterPermissions() {
         startKitt(null, null)
-        askOverlayOnce()
+        if (!askOverlayOnce()) askBatteryOnce()
     }
 
-    private fun askOverlayOnce() {
+    private fun askOverlayOnce(): Boolean {
         val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
         if (!Settings.canDrawOverlays(this) && !prefs.getBoolean("overlay_asked", false)) {
             prefs.edit().putBoolean("overlay_asked", true).apply()
@@ -392,6 +440,30 @@ class MainActivity : AppCompatActivity(), KittUi {
                     Uri.parse("package:" + packageName)
                 )
             )
+            return true
+        }
+        return false
+    }
+
+    private fun askBatteryOnce() {
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName) && !prefs.getBoolean("battery_asked", false)) {
+            prefs.edit().putBoolean("battery_asked", true).apply()
+            Toast.makeText(
+                this,
+                "Consenti a KITT di restare attivo in background",
+                Toast.LENGTH_LONG
+            ).show()
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + packageName)
+                    )
+                )
+            } catch (e: Exception) {
+            }
         }
     }
 

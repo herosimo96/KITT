@@ -7,17 +7,15 @@ import androidx.core.content.ContextCompat
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val a = intent.action
+        if (a != Intent.ACTION_BOOT_COMPLETED &&
+            a != "android.intent.action.QUICKBOOT_POWERON" &&
+            a != "com.htc.intent.action.QUICKBOOT_POWERON"
+        ) return
         try {
-            ContextCompat.startForegroundService(
-                context, Intent(context, KittService::class.java)
-            )
-        } catch (e: Exception) {
-        }
-        try {
-            val i = Intent(context, MainActivity::class.java)
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(i)
+            val s = Intent(context, KittService::class.java)
+            s.action = KittService.ACTION_BOOT
+            ContextCompat.startForegroundService(context, s)
         } catch (e: Exception) {
         }
     }

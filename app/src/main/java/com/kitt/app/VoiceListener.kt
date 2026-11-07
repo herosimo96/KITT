@@ -8,7 +8,7 @@ import org.vosk.Recognizer
 import java.io.ByteArrayOutputStream
 
 class VoiceListener(
-    private val onUtterance: (ByteArray) -> Unit,
+    private val onUtterance: (ByteArray, Boolean) -> Unit,
     private val onError: (String) -> Unit,
     private val onWake: () -> Unit,
     private val onSleep: () -> Unit
@@ -19,6 +19,8 @@ class VoiceListener(
     @Volatile private var running = false
     private var thread: Thread? = null
     private val wakeWord = Regex("\\bkitt?\\b")
+
+    fun isAlive(): Boolean = running && thread?.isAlive == true
 
     fun keepAwake(ms: Long) {
         awakeUntil = System.currentTimeMillis() + ms
@@ -78,12 +80,22 @@ class VoiceListener(
         var frames = 0
         var lastAwake = true
         var wasPaused = false
+        var fromWake = false
+        var errors = 0
+        var zeroFrames = 0
 
-        rec.startRecording()
         try {
+            rec.startRecording()
             while (running) {
                 val n = rec.read(buf, 0, frame)
-                if (n <= 0) continue
+                if (n < 0) {
+                    errors++
+                    if (errors > 50) break
+                    Thread.sleep(40)
+                    continue
+                }
+                if (n == 0) continue
+                errors = 0
 
                 if (paused) {
                     inSpeech = false
@@ -91,6 +103,8 @@ class VoiceListener(
                     pre.clear()
                     voiced = 0
                     silent = 0
+                    zeroFrames = 0
+                    fromWake = false
                     wasPaused = true
                     continue
                 }
@@ -103,10 +117,19 @@ class VoiceListener(
                 val now = System.currentTimeMillis()
 
                 var sum = 0.0
+                var peak = 0
                 for (i in 0 until n) {
                     val v = buf[i].toDouble()
                     sum += v * v
+                    val a = Math.abs(buf[i].toInt())
+                    if (a > peak) peak = a
                 }
+                if (peak == 0) zeroFrames++ else zeroFrames = 0
+                if (zeroFrames > 750) {
+                    onError("Microfono silenzioso: lo riavvio")
+                    break
+                }
+
                 val rms = Math.sqrt(sum / n)
                 val threshold = noise * 2.5 + 250.0
                 val isVoice = rms > threshold
@@ -134,6 +157,7 @@ class VoiceListener(
                         awakeUntil = now + 8000
                         lastAwake = true
                         inSpeech = true
+                        fromWake = true
                         silent = 0
                         voiced = 0
                         frames = pre.size
@@ -155,6 +179,7 @@ class VoiceListener(
                     if (isVoice) voiced++ else voiced = 0
                     if (voiced >= 4) {
                         inSpeech = true
+                        fromWake = false
                         silent = 0
                         frames = 0
                         speech.reset()
@@ -169,19 +194,24 @@ class VoiceListener(
                         inSpeech = false
                         voiced = 0
                         val voicedFrames = frames - silent
+                        val wasWake = fromWake
+                        fromWake = false
                         if (voicedFrames >= 15) {
-                            onUtterance(speech.toByteArray())
+                            onUtterance(speech.toByteArray(), wasWake)
                         }
                         speech.reset()
                     }
                 }
             }
+        } catch (e: Exception) {
+            onError("Ascolto interrotto: " + e.message)
         } finally {
             try {
                 rec.stop()
             } catch (e: Exception) {
             }
             rec.release()
+            running = false
         }
     }
 }

@@ -90,7 +90,7 @@ class SettingsActivity : AppCompatActivity() {
         KittService.visibilityCallback?.invoke()
     }
 
-    private fun startService(action: String?) {
+    private fun launchKitt(action: String?) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -295,7 +295,7 @@ class SettingsActivity : AppCompatActivity() {
                 prefs.edit().putString("groq_key", k).apply()
                 keyField.setText("")
                 Toast.makeText(this, "Chiave salvata", Toast.LENGTH_SHORT).show()
-                startService(null)
+                launchKitt(null)
             }
         })
 
@@ -303,7 +303,7 @@ class SettingsActivity : AppCompatActivity() {
         header("VOCE")
         body("Se non senti KITT parlare, premi più volte: ogni tocco prova un canale audio diverso e KITT lo annuncia. Quando lo senti, fermati: resta salvato.")
         col.addView(chip("Prova voce / cambia canale", accent, Color.parseColor("#1A1A1A"), accent) {
-            startService(KittService.ACTION_TEST)
+            launchKitt(KittService.ACTION_TEST)
         })
 
         // Crediti

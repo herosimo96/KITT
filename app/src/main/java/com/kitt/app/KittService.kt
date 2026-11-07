@@ -11,6 +11,9 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -47,6 +50,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         @Volatile var visibilityCallback: (() -> Unit)? = null
         const val ACTION_STOP = "com.kitt.app.STOP"
         const val ACTION_WAKE = "com.kitt.app.WAKE"
+        const val ACTION_TEST = "com.kitt.app.TEST"
         private const val CHANNEL = "kitt"
         private const val NOTIF_ID = 1
         private const val ESPEAK = "com.reecedunn.espeak"
@@ -64,6 +68,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private val triedEngines = mutableSetOf<String>()
     private var currentEngine = "predefinito"
     private val ttsLog = StringBuilder()
+    private var focusRequest: AudioFocusRequest? = null
+    private val routeNames = listOf("media", "navigazione", "assistente", "notifica", "sveglia", "chiamata")
 
     private var voiceStarted = false
     private var busy = false
@@ -118,6 +124,9 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         if (intent?.action == ACTION_WAKE) {
             voice.keepAwake(10000)
             onWake()
+        }
+        if (intent?.action == ACTION_TEST) {
+            testVoice()
         }
         begin()
         return START_STICKY
@@ -397,7 +406,60 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         }.start()
     }
 
-    // ---------- voce di KITT: prova tutti i motori finché uno parla italiano ----------
+    // ---------- voce di KITT ----------
+
+    private fun route(): Int =
+        getSharedPreferences("kitt", MODE_PRIVATE).getInt("tts_route", 0)
+
+    private fun attrs(route: Int): AudioAttributes {
+        val usage = when (route) {
+            1 -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+            2 -> AudioAttributes.USAGE_ASSISTANT
+            3 -> AudioAttributes.USAGE_NOTIFICATION
+            4 -> AudioAttributes.USAGE_ALARM
+            5 -> AudioAttributes.USAGE_VOICE_COMMUNICATION
+            else -> AudioAttributes.USAGE_MEDIA
+        }
+        return AudioAttributes.Builder()
+            .setUsage(usage)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+
+    private fun requestFocus(a: AudioAttributes) {
+        try {
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(a)
+                .build()
+            focusRequest = req
+            am.requestAudioFocus(req)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun abandonFocus() {
+        try {
+            val req = focusRequest ?: return
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            am.abandonAudioFocusRequest(req)
+        } catch (e: Exception) {
+        }
+        focusRequest = null
+    }
+
+    private fun testVoice() {
+        val next = (route() + 1) % routeNames.size
+        getSharedPreferences("kitt", MODE_PRIVATE).edit().putInt("tts_route", next).apply()
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        setStatus(
+            "Canale voce: " + routeNames[next] + " (volume media " + vol + "/" + max +
+                    "). Se non senti nulla, tocca di nuovo la scritta K.I.T.T."
+        )
+        speak("Prova voce, canale " + routeNames[next])
+    }
 
     override fun onInit(initStatus: Int) {
         val t = tts ?: return
@@ -445,18 +507,20 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 scan(true)
             }
             override fun onDone(utteranceId: String?) {
+                abandonFocus()
                 busy = false
                 scan(false)
                 resumeListening()
             }
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
+                abandonFocus()
                 busy = false
                 scan(false)
                 resumeListening()
             }
         })
-        setStatus("Voce pronta (" + name + ")")
+        setStatus("Voce pronta (" + name + "). Tocca la scritta K.I.T.T. per provare i canali audio")
     }
 
     private fun nextEngine() {
@@ -477,6 +541,9 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private fun speak(text: String) {
         if (ttsReady && text.isNotBlank()) {
+            val a = attrs(route())
+            tts?.setAudioAttributes(a)
+            requestFocus(a)
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
         } else {
             busy = false
@@ -488,6 +555,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         visibilityCallback = null
         removeBubble()
+        abandonFocus()
         voice.stop()
         try {
             voice.wake?.close()

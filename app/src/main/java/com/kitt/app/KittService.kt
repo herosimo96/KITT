@@ -599,36 +599,61 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun prepareWake() {
-        val modelDir = File(filesDir, "wake/vosk-model-small-en-us-0.15")
-        val okFile = File(filesDir, "wake/ok")
+        val wakeDir = File(filesDir, "wake-it-0.22")
+        val modelDir = File(wakeDir, "vosk-model-small-it-0.22")
+        val okFile = File(wakeDir, "ok")
+
         try {
-            if (!okFile.exists()) {
-                setStatus("Scarico il modello per 'Ciao KITT' (circa 40 MB), attendi...")
-                File(filesDir, "wake").deleteRecursively()
-                val url = URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+            if (!okFile.exists() || !File(modelDir, "am").exists()) {
+                wakeDir.deleteRecursively()
+                wakeDir.mkdirs()
+
+                setStatus("Scarico il modello vocale italiano (circa 48 MB)...")
+
+                val url = URL(
+                    "https://alphacephei.com/vosk/models/vosk-model-small-it-0.22.zip"
+                )
                 val conn = url.openConnection()
-                conn.connectTimeout = 15000
-                conn.readTimeout = 30000
+                conn.connectTimeout = 20000
+                conn.readTimeout = 60000
+
                 ZipInputStream(conn.getInputStream().buffered()).use { zip ->
                     var entry = zip.nextEntry
                     while (entry != null) {
-                        val out = File(filesDir, "wake/" + entry.name)
+                        val out = File(wakeDir, entry.name)
+                        val root = wakeDir.canonicalFile
+                        val target = out.canonicalFile
+                        if (!target.path.startsWith(root.path + File.separator) && target != root) {
+                            throw SecurityException("Percorso non valido nel modello vocale")
+                        }
+
                         if (entry.isDirectory) {
                             out.mkdirs()
                         } else {
                             out.parentFile?.mkdirs()
-                            FileOutputStream(out).use { zip.copyTo(it) }
+                            FileOutputStream(out).use { output ->
+                                zip.copyTo(output)
+                            }
                         }
+                        zip.closeEntry()
                         entry = zip.nextEntry
                     }
                 }
+
+                if (!File(modelDir, "am").exists()) {
+                    throw Exception("Il modello italiano scaricato è incompleto")
+                }
                 okFile.writeText("ok")
             }
+
             val model = Model(modelDir.absolutePath)
             wakeModel = model
             voice.wake = Recognizer(model, 16000.0f)
+            wakeError = ""
+            setStatus("Modello vocale italiano caricato")
         } catch (e: Exception) {
-            wakeError = "Parola di attivazione non disponibile: " + e.message
+            wakeError = "Modello vocale italiano non disponibile: ${e.message}"
+            setStatus(wakeError)
         }
     }
 

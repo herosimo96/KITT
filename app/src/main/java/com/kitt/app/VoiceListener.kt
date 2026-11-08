@@ -1,3 +1,4 @@
+
 package com.kitt.app
 
 import android.annotation.SuppressLint
@@ -18,7 +19,7 @@ class VoiceListener(
     @Volatile private var awakeUntil = 0L
     @Volatile private var running = false
     private var thread: Thread? = null
-    private val wakeWord = Regex("\\bkitt?\\b")
+    private val wakeWord = Regex("\\b(?:kitt|kit)\\b", RegexOption.IGNORE_CASE)
 
     fun isAlive(): Boolean = running && thread?.isAlive == true
 
@@ -110,9 +111,14 @@ class VoiceListener(
                 }
 
                 val w = wake
+                if (w == null) {
+                    // Senza modello di attivazione non inviare audio ambientale a Groq.
+                    Thread.sleep(100)
+                    continue
+                }
                 if (wasPaused) {
                     wasPaused = false
-                    w?.reset()
+                    w.reset()
                 }
                 val now = System.currentTimeMillis()
 
@@ -134,18 +140,18 @@ class VoiceListener(
                 val threshold = noise * 2.5 + 250.0
                 val isVoice = rms > threshold
 
-                val awake = w == null || inSpeech || now < awakeUntil
+                val awake = inSpeech || now < awakeUntil
                 if (awake != lastAwake) {
                     lastAwake = awake
                     if (!awake) {
-                        w?.reset()
+                        w.reset()
                         voiced = 0
                         onSleep()
                     }
                 }
 
-                // Attesa: ascolta solo la parola "KITT" (offline)
-                if (!awake && w != null) {
+                // In attesa ascolta solo la parola KITT, offline.
+                if (!awake) {
                     if (!isVoice) {
                         noise = (noise * 0.97 + rms * 0.03).coerceAtLeast(100.0)
                     }
@@ -169,7 +175,7 @@ class VoiceListener(
                     continue
                 }
 
-                // Attivo: registra la frase e la invia
+                // Attivo: registra la frase e la invia.
                 if (!inSpeech) {
                     if (!isVoice) {
                         noise = (noise * 0.97 + rms * 0.03).coerceAtLeast(100.0)

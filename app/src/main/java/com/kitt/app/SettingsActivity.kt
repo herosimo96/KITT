@@ -212,6 +212,31 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         val dark = withAlpha(Color.WHITE, 16)
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+
+        fun slider(label: String, key: String) {
+            val saved = prefs.getInt(key, 100)
+            val lab = TextView(this)
+            lab.setTextColor(Color.WHITE)
+            lab.text = label + ": " + saved + "%"
+            lab.setPadding(0, dp(8), 0, 0)
+            cur.addView(lab)
+            val bar = SeekBar(this)
+            bar.max = 100
+            bar.progress = (saved - 50).coerceIn(0, 100)
+            bar.progressTintList = ColorStateList.valueOf(accent)
+            bar.thumbTintList = ColorStateList.valueOf(accent)
+            bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    val v = p + 50
+                    lab.text = label + ": " + v + "%"
+                    if (fromUser) prefs.edit().putInt(key, v).apply()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+            cur.addView(bar)
+        }
 
         // Anteprime
         val scanPreview = ScannerView(this)
@@ -312,7 +337,6 @@ class SettingsActivity : AppCompatActivity() {
 
         // Chiave Groq
         card("CHIAVE GROQ")
-        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
         val hasKey = !prefs.getString("groq_key", "").isNullOrBlank()
         val keyField = field(
             if (hasKey) "Chiave già salvata: incolla per cambiarla" else "Incolla qui la chiave Groq",
@@ -349,8 +373,115 @@ class SettingsActivity : AppCompatActivity() {
             }
         })
 
-        // Voce
-        card("VOCE")
+        // Voce online
+        card("VOCE ONLINE (GEMINI)")
+        body("Voce molto più naturale, senza usare i motori dello stereo. Serve internet e una chiave gratuita: aistudio.google.com/apikey. Se non funziona o la quota finisce, KITT usa la voce del sistema.")
+        val gHas = !prefs.getString("gemini_key", "").isNullOrBlank()
+        val gField = field(
+            if (gHas) "Chiave già salvata: incolla per cambiarla" else "Incolla qui la chiave Gemini",
+            ""
+        )
+        cur.addView(gField)
+        cur.addView(chip("Salva chiave Gemini", accent, dark, accent) {
+            val k = gField.text.toString().trim()
+            if (k.isNotEmpty()) {
+                prefs.edit().putString("gemini_key", k).apply()
+                gField.setText("")
+                Toast.makeText(this, "Chiave Gemini salvata", Toast.LENGTH_SHORT).show()
+            }
+        })
+        cur.addView(checkbox("Usa la voce online", prefs.getBoolean("cloud_on", false)) {
+            prefs.edit().putBoolean("cloud_on", it).apply()
+        })
+        body("Voce (provale: Charon, Orus, Puck e Fenrir di solito suonano maschili):")
+        val cloudVoices = listOf("Charon", "Orus", "Puck", "Fenrir", "Iapetus", "Algieba", "Kore", "Aoede")
+        val cvText = body("Voce scelta: " + (prefs.getString("cloud_voice", "Charon") ?: "Charon"))
+        for (group in cloudVoices.chunked(4)) {
+            chipRow(group.map { n ->
+                chip(n, accent, dark, accent) {
+                    prefs.edit().putString("cloud_voice", n).apply()
+                    cvText.text = "Voce scelta: " + n
+                    launchKitt(KittService.ACTION_SAMPLE)
+                }
+            })
+        }
+        body("Modello (lascia vuoto per quello predefinito, gemini-3.1-flash-tts-preview):")
+        val modelField = field("gemini-3.1-flash-tts-preview", prefs.getString("cloud_model", "") ?: "")
+        modelField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                prefs.edit().putString("cloud_model", s.toString().trim()).apply()
+            }
+        })
+        cur.addView(modelField)
+        cur.addView(chip("Ascolta anteprima", accent, dark, accent) {
+            launchKitt(KittService.ACTION_SAMPLE)
+        })
+        body("I modelli vocali sono in anteprima e hanno limiti gratuiti ridotti. Nel piano gratuito Google può usare i testi inviati per migliorare i suoi prodotti.")
+
+        // Voce di sistema
+        card("VOCE DI SISTEMA")
+        body("Scegli il motore vocale di Android. Con \"Automatico\" KITT usa SherpaTTS se è installato.")
+        val engineList = ArrayList<Pair<String, String>>()
+        engineList.add(Pair("Automatico", ""))
+        try {
+            val svc = packageManager.queryIntentServices(Intent("android.intent.action.TTS_SERVICE"), 0)
+            for (ri in svc) {
+                engineList.add(Pair(ri.loadLabel(packageManager).toString(), ri.serviceInfo.packageName))
+            }
+        } catch (e: Exception) {
+        }
+        val savedEngine = prefs.getString("tts_engine", "") ?: ""
+        val engineText = body(
+            "Motore scelto: " + (engineList.firstOrNull { it.second == savedEngine }?.first ?: "Automatico")
+        )
+        for (group in engineList.chunked(2)) {
+            chipRow(group.map { e ->
+                chip(e.first, accent, dark, accent) {
+                    prefs.edit()
+                        .putString("tts_engine", e.second)
+                        .putString("tts_voice", "")
+                        .apply()
+                    engineText.text = "Motore scelto: " + e.first
+                    launchKitt(KittService.ACTION_TTS)
+                }
+            })
+        }
+
+        body("Voce (tra quelle italiane che il motore mette a disposizione):")
+        val voices = KittService.voiceNames
+        val savedVoice = prefs.getString("tts_voice", "") ?: ""
+        val voiceText = body(
+            if (voices.isEmpty()) {
+                "Nessuna voce elencata dal motore: sceglie lui da solo. Dopo aver cambiato motore tocca Aggiorna elenco voci."
+            } else {
+                "Voce scelta: " + (if (savedVoice.isEmpty()) "predefinita del motore" else savedVoice)
+            }
+        )
+        if (voices.isNotEmpty()) {
+            val voiceList = ArrayList<Pair<String, String>>()
+            voiceList.add(Pair("Predefinita", ""))
+            for (n in voices) voiceList.add(Pair(n, n))
+            for (group in voiceList.chunked(2)) {
+                chipRow(group.map { v ->
+                    chip(v.first, accent, dark, accent) {
+                        prefs.edit().putString("tts_voice", v.second).apply()
+                        voiceText.text = "Voce scelta: " +
+                                (if (v.second.isEmpty()) "predefinita del motore" else v.second)
+                        launchKitt(KittService.ACTION_TTS)
+                    }
+                })
+            }
+        }
+        cur.addView(chip("Aggiorna elenco voci", accent, dark, accent) { recreate() })
+
+        body("Velocità e tono (con eSpeak prova velocità 85-90% e tono 85%).")
+        slider("Velocità", "tts_rate")
+        slider("Tono", "tts_pitch")
+        cur.addView(chip("Ascolta anteprima", accent, dark, accent) {
+            launchKitt(KittService.ACTION_SAMPLE)
+        })
         body("Se non senti KITT parlare, premi più volte: ogni tocco prova un canale audio diverso e KITT lo annuncia. Quando lo senti, fermati: resta salvato.")
         cur.addView(chip("Prova voce / cambia canale", accent, dark, accent) {
             launchKitt(KittService.ACTION_TEST)
@@ -358,7 +489,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // Crediti
         val credit = TextView(this)
-        credit.text = "K.I.T.T. v1.1\nSviluppato da\nSimone Campanale Nik (Herosimo96)"
+        credit.text = "K.I.T.T. v1.4\nSviluppato da\nSimone Campanale Nik (Herosimo96)"
         credit.setTextColor(accent)
         credit.textSize = 16f
         credit.typeface = Typeface.MONOSPACE

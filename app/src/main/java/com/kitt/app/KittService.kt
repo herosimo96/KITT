@@ -15,7 +15,9 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -54,6 +56,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         @Volatile var lastStatus: String = "Avvio..."
         @Volatile var appVisible = false
         @Volatile var visibilityCallback: (() -> Unit)? = null
+        @Volatile var voiceNames: List<String> = emptyList()
         val chat: MutableList<Pair<Boolean, String>> =
             java.util.Collections.synchronizedList(ArrayList<Pair<Boolean, String>>())
         const val ACTION_STOP = "com.kitt.app.STOP"
@@ -61,10 +64,13 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_TEST = "com.kitt.app.TEST"
         const val ACTION_BOOT = "com.kitt.app.BOOT"
         const val ACTION_TEXT = "com.kitt.app.TEXT"
+        const val ACTION_TTS = "com.kitt.app.TTS"
+        const val ACTION_SAMPLE = "com.kitt.app.SAMPLE"
         const val EXTRA_TEXT = "text"
         private const val CHANNEL = "kitt"
         private const val NOTIF_ID = 1
         private const val ESPEAK = "com.reecedunn.espeak"
+        private const val SHERPA = "org.woheller69.ttsengine"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -79,9 +85,13 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private val triedEngines = mutableSetOf<String>()
     private var currentEngine = "predefinito"
     private val ttsLog = StringBuilder()
+    private var sampleWhenReady = false
     private var focusRequest: AudioFocusRequest? = null
     private val routeNames = listOf("media", "navigazione", "assistente", "notifica", "sveglia", "chiamata")
     private var greetText: String? = null
+
+    @Volatile private var cloudToken = 0
+    @Volatile private var player: AudioTrack? = null
 
     private var voiceStarted = false
     private var busySince = 0L
@@ -116,6 +126,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private val speakGuard = Runnable {
         if (busy) {
+            stopCloud()
             busy = false
             abandonFocus()
             scan(false)
@@ -149,7 +160,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             { onWake() },
             { onSleep() }
         )
-        tts = TextToSpeech(this, this)
+        startTts()
         visibilityCallback = { handler.post { updateBubble() } }
     }
 
@@ -159,6 +170,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             stoppedByUser = true
             serviceActive = false
             handler.removeCallbacks(watchdog)
+            stopCloud()
             removeBubble()
             setStatus("KITT spento")
             stopForeground(true)
@@ -183,6 +195,11 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         when (action) {
             ACTION_WAKE -> resumeKitt()
             ACTION_TEST -> testVoice()
+            ACTION_TTS -> {
+                sampleWhenReady = true
+                startTts()
+            }
+            ACTION_SAMPLE -> sampleVoice()
             ACTION_TEXT -> {
                 val t = intent?.getStringExtra(EXTRA_TEXT)
                 if (!t.isNullOrBlank()) handleText(t)
@@ -275,7 +292,8 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         if (!serviceActive) return
         acquireLocks()
         val now = System.currentTimeMillis()
-        if (busy && now - busySince > 45000) {
+        if (busy && now - busySince > 60000) {
+            stopCloud()
             busy = false
             abandonFocus()
             scan(false)
@@ -321,7 +339,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                     val failure = commands.run(r.action, r.arg)
                     val said = failure ?: r.reply
                     if (said.isNotBlank()) addChat(false, said)
-                    if (KittTheme.speakTyped(this) && ttsReady && said.isNotBlank()) {
+                    if (KittTheme.speakTyped(this) && (ttsReady || cloudOn()) && said.isNotBlank()) {
                         speak(said)
                     } else {
                         scan(false)
@@ -356,7 +374,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     private fun trySpeakGreeting() {
         val g = greetText ?: return
-        if (!ttsReady) return
+        if (!ttsReady && !cloudOn()) return
         greetText = null
         speak(g)
     }
@@ -366,6 +384,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     private fun pauseKitt() {
         userPaused = true
         handler.removeCallbacks(speakGuard)
+        stopCloud()
         try {
             tts?.stop()
         } catch (e: Exception) {
@@ -599,61 +618,36 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun prepareWake() {
-        val wakeDir = File(filesDir, "wake-it-0.22")
-        val modelDir = File(wakeDir, "vosk-model-small-it-0.22")
-        val okFile = File(wakeDir, "ok")
-
+        val modelDir = File(filesDir, "wake/vosk-model-small-en-us-0.15")
+        val okFile = File(filesDir, "wake/ok")
         try {
-            if (!okFile.exists() || !File(modelDir, "am").exists()) {
-                wakeDir.deleteRecursively()
-                wakeDir.mkdirs()
-
-                setStatus("Scarico il modello vocale italiano (circa 48 MB)...")
-
-                val url = URL(
-                    "https://alphacephei.com/vosk/models/vosk-model-small-it-0.22.zip"
-                )
+            if (!okFile.exists()) {
+                setStatus("Scarico il modello per 'Ciao KITT' (circa 40 MB), attendi...")
+                File(filesDir, "wake").deleteRecursively()
+                val url = URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
                 val conn = url.openConnection()
-                conn.connectTimeout = 20000
-                conn.readTimeout = 60000
-
+                conn.connectTimeout = 15000
+                conn.readTimeout = 30000
                 ZipInputStream(conn.getInputStream().buffered()).use { zip ->
                     var entry = zip.nextEntry
                     while (entry != null) {
-                        val out = File(wakeDir, entry.name)
-                        val root = wakeDir.canonicalFile
-                        val target = out.canonicalFile
-                        if (!target.path.startsWith(root.path + File.separator) && target != root) {
-                            throw SecurityException("Percorso non valido nel modello vocale")
-                        }
-
+                        val out = File(filesDir, "wake/" + entry.name)
                         if (entry.isDirectory) {
                             out.mkdirs()
                         } else {
                             out.parentFile?.mkdirs()
-                            FileOutputStream(out).use { output ->
-                                zip.copyTo(output)
-                            }
+                            FileOutputStream(out).use { zip.copyTo(it) }
                         }
-                        zip.closeEntry()
                         entry = zip.nextEntry
                     }
                 }
-
-                if (!File(modelDir, "am").exists()) {
-                    throw Exception("Il modello italiano scaricato è incompleto")
-                }
                 okFile.writeText("ok")
             }
-
             val model = Model(modelDir.absolutePath)
             wakeModel = model
             voice.wake = Recognizer(model, 16000.0f)
-            wakeError = ""
-            setStatus("Modello vocale italiano caricato")
         } catch (e: Exception) {
-            wakeError = "Modello vocale italiano non disponibile: ${e.message}"
-            setStatus(wakeError)
+            wakeError = "Parola di attivazione non disponibile: " + e.message
         }
     }
 
@@ -750,6 +744,139 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
     // ---------- voce di KITT ----------
 
+    private fun cloudOn(): Boolean {
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        return prefs.getBoolean("cloud_on", false) &&
+                !prefs.getString("gemini_key", "").isNullOrBlank()
+    }
+
+    private fun stopCloud() {
+        cloudToken++
+        try {
+            player?.stop()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun finishSpeech() {
+        handler.removeCallbacks(speakGuard)
+        abandonFocus()
+        busy = false
+        scan(false)
+        resumeListening()
+    }
+
+    private fun playPcm(pcm: ByteArray, rate: Int, a: AudioAttributes, token: Int) {
+        val size = pcm.size - (pcm.size % 2)
+        if (size <= 0) throw Exception("audio vuoto")
+        val fmt = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(rate)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+            .build()
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(a)
+            .setAudioFormat(fmt)
+            .setBufferSizeInBytes(size)
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
+        player = track
+        try {
+            track.write(pcm, 0, size)
+            val frames = size / 2
+            track.play()
+            val limit = SystemClock.elapsedRealtime() + frames * 1000L / rate + 3000L
+            while (token == cloudToken &&
+                track.playbackHeadPosition < frames &&
+                SystemClock.elapsedRealtime() < limit
+            ) {
+                Thread.sleep(40)
+            }
+        } finally {
+            try {
+                track.stop()
+            } catch (e: Exception) {
+            }
+            track.release()
+            player = null
+        }
+    }
+
+    private fun speakCloud(text: String) {
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        val key = prefs.getString("gemini_key", "") ?: ""
+        var model = (prefs.getString("cloud_model", "") ?: "").trim()
+        if (model.isEmpty()) model = "gemini-3.1-flash-tts-preview"
+        if (model.startsWith("models/")) model = model.removePrefix("models/")
+        val voiceName = prefs.getString("cloud_voice", "Charon") ?: "Charon"
+
+        busy = true
+        voice.paused = true
+        scan(true)
+        val a = attrs(route())
+        requestFocus(a)
+        val token = ++cloudToken
+        handler.removeCallbacks(speakGuard)
+        handler.postDelayed(speakGuard, 25000L + text.length * 120L)
+        Thread {
+            try {
+                val (pcm, rate) = CloudTts.synth(key, model, voiceName, text)
+                if (token != cloudToken) return@Thread
+                playPcm(pcm, rate, a, token)
+                if (token == cloudToken) handler.post { finishSpeech() }
+            } catch (e: Exception) {
+                if (token == cloudToken) {
+                    handler.post {
+                        setStatus("Voce online non disponibile (" + (e.message ?: "errore") + "): uso la voce del sistema")
+                        speakSystem(text)
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun isInstalled(pkg: String): Boolean = try {
+        packageManager.getPackageInfo(pkg, 0)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun startTts() {
+        ttsReady = false
+        triedEngines.clear()
+        ttsLog.setLength(0)
+        ttsProblem = ""
+        currentEngine = "predefinito"
+        var pref = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_engine", "") ?: ""
+        if (pref.isEmpty() && isInstalled(SHERPA)) pref = SHERPA
+        if (pref.isNotEmpty() && !isInstalled(pref)) pref = ""
+        try {
+            tts?.shutdown()
+        } catch (e: Exception) {
+        }
+        if (pref.isNotEmpty()) {
+            currentEngine = pref
+            tts = TextToSpeech(this, this, pref)
+        } else {
+            tts = TextToSpeech(this, this)
+        }
+    }
+
+    private fun applyVoice(t: TextToSpeech) {
+        val name = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_voice", "") ?: ""
+        if (name.isEmpty()) return
+        try {
+            val v = (t.voices ?: emptySet()).firstOrNull { it.name == name }
+            if (v != null) t.setVoice(v)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun sampleVoice() {
+        speak("Ciao " + KittTheme.userName(this) + ", sono KITT. Questa è la mia voce.")
+    }
+
     private fun route(): Int =
         getSharedPreferences("kitt", MODE_PRIVATE).getInt("tts_route", 0)
 
@@ -843,6 +970,15 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
         ttsReady = true
         ttsProblem = ""
+        try {
+            voiceNames = (t.voices ?: emptySet())
+                .filter { it.locale.language == "it" }
+                .map { it.name }
+                .sorted()
+        } catch (e: Exception) {
+            voiceNames = emptyList()
+        }
+        applyVoice(t)
         t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 voice.paused = true
@@ -864,14 +1000,25 @@ class KittService : Service(), TextToSpeech.OnInitListener {
                 resumeListening()
             }
         })
-        setStatus("Voce pronta (" + name + ")")
+        val chosen = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_voice", "") ?: ""
+        setStatus("Voce pronta (" + name + (if (chosen.isNotEmpty()) ", " + chosen else "") + ")")
         trySpeakGreeting()
+        if (sampleWhenReady) {
+            sampleWhenReady = false
+            sampleVoice()
+        }
     }
 
     private fun nextEngine() {
         val next = engines
             .filter { it !in triedEngines }
-            .sortedBy { if (it == ESPEAK) 0 else 1 }
+            .sortedBy {
+                when (it) {
+                    SHERPA -> 0
+                    ESPEAK -> 1
+                    else -> 2
+                }
+            }
             .firstOrNull()
         if (next == null) {
             val list = if (engines.isEmpty()) "nessuno" else engines.joinToString(", ")
@@ -885,8 +1032,22 @@ class KittService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun speak(text: String) {
+        if (text.isBlank()) {
+            busy = false
+            scan(false)
+            resumeListening()
+            return
+        }
+        if (cloudOn()) speakCloud(text) else speakSystem(text)
+    }
+
+    private fun speakSystem(text: String) {
         if (ttsReady && text.isNotBlank()) {
             busy = true
+            val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+            tts?.let { applyVoice(it) }
+            tts?.setSpeechRate(prefs.getInt("tts_rate", 100) / 100f)
+            tts?.setPitch(prefs.getInt("tts_pitch", 100) / 100f)
             val a = attrs(route())
             tts?.setAudioAttributes(a)
             requestFocus(a)
@@ -904,6 +1065,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         handler.removeCallbacks(watchdog)
         handler.removeCallbacks(speakGuard)
         handler.removeCallbacks(hideControls)
+        stopCloud()
         visibilityCallback = null
         removeBubble()
         abandonFocus()

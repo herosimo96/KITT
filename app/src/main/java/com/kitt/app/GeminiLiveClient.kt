@@ -1,3 +1,4 @@
+
 package com.kitt.app
 
 import android.annotation.SuppressLint
@@ -35,9 +36,9 @@ class GeminiLiveClient(
         private const val OUTPUT_RATE = 24000
     }
 
+    // Nessun ping automatico: evita il timeout riscontrato.
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
     private val audioExecutor = Executors.newSingleThreadExecutor()
@@ -166,6 +167,15 @@ class GeminiLiveClient(
                         if (!closedByUser.get()) {
                             onClosed("Errore Gemini Live: $detail")
                         }
+                    }
+
+                    override fun onClosing(
+                        webSocket: WebSocket,
+                        code: Int,
+                        reason: String
+                    ) {
+                        onStatus("Chiusura sessione Gemini: $reason")
+                        webSocket.close(code, reason)
                     }
 
                     override fun onClosed(

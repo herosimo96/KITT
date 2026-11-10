@@ -159,7 +159,7 @@ class GeminiLiveClient(
                         running.set(false)
 
                         val detail = response?.let {
-                            "HTTP ${it.code}:${it.message}"
+                            "HTTP ${it.code}: ${it.message}"
                         } ?: (t.message ?: "errore di rete")
 
                         if (!closedByUser.get()) {
@@ -424,7 +424,7 @@ class GeminiLiveClient(
             Per chiamate, SMS e azioni importanti chiedi conferma
             quando necessario.
 
-            Per inviare SMS prepara prima il messaggio e chiedi
+            For inviare SMS prepara prima il messaggio e chiedi
             conferma esplicita prima di inviare.
 
             Non inventare informazioni in tempo reale.
@@ -503,3 +503,114 @@ class GeminiLiveClient(
                 )
                 .setBufferSizeInBytes(maxOf(minOut, 8192))
                 .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+                .apply { play() }
+
+            rec.startRecording()
+
+            micThread = Thread {
+                val buffer = ByteArray(2048)
+
+                try {
+                    while (running.get() && setupReady.get()) {
+                        val count = rec.read(buffer, 0, buffer.size)
+
+                        if (count > 0) {
+                            val audio = JSONObject()
+                                .put(
+                                    "data",
+                                    Base64.encodeToString(
+                                        buffer.copyOf(count),
+                                        Base64.NO_WRAP
+                                    )
+                                )
+                                .put("mimeType", "audio/pcm;rate=16000")
+
+                            val message = JSONObject().put(
+                                "realtimeInput",
+                                JSONObject().put("audio", audio)
+                            )
+
+                            socket?.send(message.toString())
+                        } else if (count < 0) {
+                            throw IllegalStateException(
+                                "Errore lettura microfono: $count"
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (running.get()) {
+                        onStatus("Problema microfono: ${e.message}")
+                    }
+                }
+            }.apply {
+                name = "KITT-Gemini-Microphone"
+                start()
+            }
+        } catch (e: Exception) {
+            onStatus("Errore avvio audio: ${e.message}")
+            running.set(false)
+            stopAudio()
+            socket?.close(1011, "Audio initialization failed")
+            onClosed("Impossibile avviare il microfono: ${e.message}")
+        }
+    }
+
+    private fun playPcm(pcm: ByteArray) {
+        if (!running.get()) return
+
+        try {
+            player?.write(pcm, 0, pcm.size)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun flushPlayback() {
+        try {
+            player?.pause()
+            player?.flush()
+            player?.play()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun stopAudio() {
+        val oldRecorder = recorder
+        recorder = null
+
+        try {
+            oldRecorder?.stop()
+        } catch (_: Exception) {
+        }
+
+        try {
+            oldRecorder?.release()
+        } catch (_: Exception) {
+        }
+
+        val oldPlayer = player
+        player = null
+
+        try {
+            oldPlayer?.pause()
+            oldPlayer?.flush()
+            oldPlayer?.release()
+        } catch (_: Exception) {
+        }
+
+        try {
+            echoCanceler?.release()
+        } catch (_: Exception) {
+        }
+        echoCanceler = null
+
+        try {
+            noiseSuppressor?.release()
+        } catch (_: Exception) {
+        }
+        noiseSuppressor = null
+
+        micThread?.interrupt()
+        micThread = null
+    }
+}

@@ -1,7 +1,6 @@
 package com.kitt.app
 
 import android.Manifest
-import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -13,21 +12,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioTrack
-import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
-import android.os.PowerManager
-import android.os.SystemClock
 import android.provider.Settings
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -36,13 +23,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import org.vosk.Model
-import org.vosk.Recognizer
-import java.io.File
-import java.io.FileOutputStream
-import java.net.URL
-import java.util.Locale
-import java.util.zip.ZipInputStream
 
 interface KittUi {
     fun status(text: String)
@@ -50,15 +30,21 @@ interface KittUi {
     fun message(fromUser: Boolean, text: String)
 }
 
-class KittService : Service(), TextToSpeech.OnInitListener {
+class KittService : Service() {
+
     companion object {
         @Volatile var ui: KittUi? = null
-        @Volatile var lastStatus: String = "Avvio..."
+        @Volatile var lastStatus = "Avvio..."
         @Volatile var appVisible = false
         @Volatile var visibilityCallback: (() -> Unit)? = null
+
         @Volatile var voiceNames: List<String> = emptyList()
+
         val chat: MutableList<Pair<Boolean, String>> =
-            java.util.Collections.synchronizedList(ArrayList<Pair<Boolean, String>>())
+            java.util.Collections.synchronizedList(
+                ArrayList<Pair<Boolean, String>>()
+            )
+
         const val ACTION_STOP = "com.kitt.app.STOP"
         const val ACTION_WAKE = "com.kitt.app.WAKE"
         const val ACTION_TEST = "com.kitt.app.TEST"
@@ -66,379 +52,312 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_TEXT = "com.kitt.app.TEXT"
         const val ACTION_TTS = "com.kitt.app.TTS"
         const val ACTION_SAMPLE = "com.kitt.app.SAMPLE"
+
         const val EXTRA_TEXT = "text"
+
         private const val CHANNEL = "kitt"
         private const val NOTIF_ID = 1
-        private const val ESPEAK = "com.reecedunn.espeak"
-        private const val SHERPA = "org.woheller69.ttsengine"
     }
 
-    private val handler = Handler(Looper.getMainLooper())
-    private lateinit var brain: Brain
     private lateinit var commands: Commands
-    private lateinit var voice: VoiceListener
 
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private var ttsProblem = ""
-    private var engines: List<String> = emptyList()
-    private val triedEngines = mutableSetOf<String>()
-    private var currentEngine = "predefinito"
-    private val ttsLog = StringBuilder()
-    private var sampleWhenReady = false
-    private var focusRequest: AudioFocusRequest? = null
-    private val routeNames = listOf("media", "navigazione", "assistente", "notifica", "sveglia", "chiamata")
-    private var greetText: String? = null
+    @Volatile
+    private var gemini: GeminiLiveClient? = null
 
-    @Volatile private var cloudToken = 0
-    @Volatile private var player: AudioTrack? = null
-
-    private var voiceStarted = false
-    private var busySince = 0L
-    private var busy = false
-        set(value) {
-            field = value
-            if (value) busySince = System.currentTimeMillis()
-        }
-    private var userPaused = false
-    private var stoppedByUser = false
-    private var watchdogStarted = false
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var wakeModel: Model? = null
-    private var wakeError = ""
-
-    private var bubble: LinearLayout? = null
-    private var bubbleScanner: ScannerView? = null
-    private var bubbleBg: GradientDrawable? = null
-    private var bubblePause: TextView? = null
-    private var bubbleClose: TextView? = null
-    private var controlsVisible = false
-    private var bubbleX = 0
-    private var bubbleY = 0
-    private var dismissed = false
+    @Volatile
     private var serviceActive = false
 
-    private val hideControls = Runnable {
-        controlsVisible = false
-        refreshBubble()
-    }
+    @Volatile
+    private var userPaused = false
 
-    private val speakGuard = Runnable {
-        if (busy) {
-            stopCloud()
-            busy = false
-            abandonFocus()
-            scan(false)
-            resumeListening()
-        }
-    }
+    @Volatile
+    private var stoppedByUser = false
 
-    private val watchdog = object : Runnable {
-        override fun run() {
-            try {
-                checkHealth()
-            } catch (e: Exception) {
-            }
-            handler.postDelayed(this, 20000)
-        }
-    }
+    private var bubble: LinearLayout? = null
+    private var scanner: ScannerView? = null
+    private var bubblePause: TextView? = null
+    private var bubbleClose: TextView? = null
+    private var bubbleBg: GradientDrawable? = null
+
+    private var controlsVisible = false
+    private var dismissed = false
+    private var bubbleX = 20
+    private var bubbleY = 160
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
     override fun onCreate() {
         super.onCreate()
-        bubbleX = dp(16)
-        bubbleY = dp(140)
-        brain = Brain(this)
         commands = Commands(this)
-        voice = VoiceListener(
-            { pcm, fromWake -> onUtterance(pcm, fromWake) },
-            { msg -> setStatus(msg) },
-            { onWake() },
-            { onSleep() }
-        )
-        startTts()
-        visibilityCallback = { handler.post { updateBubble() } }
+        visibilityCallback = {
+            android.os.Handler(mainLooper).post {
+                updateBubble()
+            }
+        }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
         val action = intent?.action
+
         if (action == ACTION_STOP) {
             stoppedByUser = true
-            serviceActive = false
-            handler.removeCallbacks(watchdog)
-            stopCloud()
-            removeBubble()
-            setStatus("KITT spento")
-            stopForeground(true)
+            stopKitt()
             stopSelf()
             return START_NOT_STICKY
         }
+
         try {
             startInForeground()
         } catch (e: Exception) {
-            setStatus("Concedi il permesso del microfono a KITT")
+            setStatus("Impossibile avviare KITT. Controlla i permessi.")
             stopSelf()
             return START_NOT_STICKY
         }
+
         stoppedByUser = false
         serviceActive = true
-        acquireLocks()
-        if (!watchdogStarted) {
-            watchdogStarted = true
-            handler.postDelayed(watchdog, 20000)
-        }
+
         updateBubble()
+
         when (action) {
-            ACTION_WAKE -> resumeKitt()
-            ACTION_TEST -> testVoice()
-            ACTION_TTS -> {
-                sampleWhenReady = true
-                startTts()
+            ACTION_WAKE -> {
+                userPaused = false
+                if (gemini == null) connectGemini()
+                else setStatus("KITT è già in ascolto.")
             }
-            ACTION_SAMPLE -> sampleVoice()
+
             ACTION_TEXT -> {
-                val t = intent?.getStringExtra(EXTRA_TEXT)
-                if (!t.isNullOrBlank()) handleText(t)
+                val text = intent.getStringExtra(EXTRA_TEXT)
+                if (!text.isNullOrBlank()) {
+                    sendText(text)
+                }
+                if (gemini == null) connectGemini()
             }
-            ACTION_BOOT -> maybeGreet(true)
-            else -> maybeGreet(false)
+
+            ACTION_TEST,
+            ACTION_TTS,
+            ACTION_SAMPLE -> {
+                setStatus("La voce di KITT è gestita da Gemini Live.")
+                if (gemini == null) connectGemini()
+            }
+
+            else -> {
+                if (gemini == null) connectGemini()
+            }
         }
-        begin()
+
         return START_STICKY
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        if (!stoppedByUser) {
-            try {
-                val am = getSystemService(ALARM_SERVICE) as AlarmManager
-                val pi = PendingIntent.getForegroundService(
-                    this, 2, Intent(this, KittService::class.java),
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
-                am.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 2000, pi)
-            } catch (e: Exception) {
-            }
-        }
-        super.onTaskRemoved(rootIntent)
-    }
-
     private fun startInForeground() {
-        val channel = NotificationChannel(CHANNEL, "KITT", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val manager =
+            getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+        val channel = NotificationChannel(
+            CHANNEL,
+            "KITT",
+            NotificationManager.IMPORTANCE_LOW
+        )
+
+        manager.createNotificationChannel(channel)
+
         val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+
         val stop = PendingIntent.getService(
-            this, 1,
+            this,
+            1,
             Intent(this, KittService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val n = NotificationCompat.Builder(this, CHANNEL)
+
+        val notification = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle("K.I.T.T. attivo")
-            .setContentText("Di' \"Ciao KITT\" per parlare")
+            .setContentText("Di' Ciao KITT per parlare")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(open)
             .addAction(0, "Spegni", stop)
             .setOngoing(true)
             .build()
+
         if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            startForeground(
+                NOTIF_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
         } else {
-            startForeground(NOTIF_ID, n)
+            startForeground(NOTIF_ID, notification)
         }
     }
 
-    // ---------- tenere KITT sveglio ----------
+    private fun connectGemini() {
+        if (gemini != null) return
 
-    private fun acquireLocks() {
-        try {
-            if (wakeLock == null) {
-                val pm = getSystemService(POWER_SERVICE) as PowerManager
-                val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kitt:listen")
-                wl.setReferenceCounted(false)
-                wakeLock = wl
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            setStatus("Concedi a KITT il permesso del microfono.")
+            return
+        }
+
+        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
+        val key = prefs.getString("gemini_key", "") ?: ""
+
+        if (key.isBlank()) {
+            setStatus("Inserisci la chiave API Gemini nelle Impostazioni.")
+            return
+        }
+
+        userPaused = false
+        setStatus("Collegamento a Gemini Live...")
+
+        val session = GeminiLiveClient(
+            apiKey = key,
+
+            onStatus = { message ->
+                setStatus(message)
+            },
+
+            onUserText = { text ->
+                if (text.isNotBlank()) {
+                    addChat(true, text)
+                }
+            },
+
+            onAssistantText = { text ->
+                if (text.isNotBlank()) {
+                    addChat(false, text)
+                }
+            },
+
+            onToolCall = { action, arg ->
+                commands.run(action, arg)
+            },
+
+            onClosed = { message ->
+                gemini = null
+                setStatus(message)
+                scan(false)
             }
-            if (wakeLock?.isHeld != true) wakeLock?.acquire()
-        } catch (e: Exception) {
-        }
-        try {
-            if (wifiLock == null) {
-                val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-                val wl = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "kitt:wifi")
-                wl.setReferenceCounted(false)
-                wifiLock = wl
-            }
-            if (wifiLock?.isHeld != true) wifiLock?.acquire()
-        } catch (e: Exception) {
-        }
+        )
+
+        gemini = session
+        session.start()
     }
 
-    private fun releaseLocks() {
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (e: Exception) {
-        }
-        try {
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (e: Exception) {
-        }
-    }
+    private fun sendText(text: String) {
+        if (text.isBlank()) return
 
-    private fun checkHealth() {
-        if (!serviceActive) return
-        acquireLocks()
-        val now = System.currentTimeMillis()
-        if (busy && now - busySince > 60000) {
-            stopCloud()
-            busy = false
-            abandonFocus()
-            scan(false)
-            resumeListening()
-        }
-        if (!busy && voice.paused) {
-            voice.paused = false
-        }
-        if (voiceStarted && !voice.isAlive()) {
-            voice.start()
-            setStatus(idleStatus())
-        }
-    }
+        addChat(true, text)
 
-    // ---------- chat ----------
+        val current = gemini
+
+        if (current == null) {
+            setStatus("Connessione a Gemini Live...")
+            connectGemini()
+
+            android.os.Handler(mainLooper).postDelayed({
+                gemini?.sendText(text)
+            }, 2500)
+
+            return
+        }
+
+        current.sendText(text)
+        setStatus("Messaggio inviato a KITT.")
+    }
 
     private fun addChat(fromUser: Boolean, text: String) {
         synchronized(chat) {
             chat.add(Pair(fromUser, text))
-            while (chat.size > 200) chat.removeAt(0)
-        }
-        handler.post { ui?.message(fromUser, text) }
-    }
-
-    private fun idleStatus(): String =
-        if (!voiceStarted) "Pronto"
-        else if (userPaused) "In pausa. Di' \"Ciao KITT\" o tocca PLAY"
-        else if (voice.wake != null) "In attesa: di' \"Ciao KITT\""
-        else "Ti ascolto..."
-
-    private fun handleText(text: String) {
-        addChat(true, text)
-        if (!brain.hasKey()) {
-            addChat(false, "Manca la chiave Groq: inseriscila in Impostazioni.")
-            return
-        }
-        setStatus("KITT sta pensando...")
-        scan(true)
-        Thread {
-            try {
-                val r = brain.think(text)
-                handler.post {
-                    val failure = commands.run(r.action, r.arg)
-                    val said = failure ?: r.reply
-                    if (said.isNotBlank()) addChat(false, said)
-                    if (KittTheme.speakTyped(this) && (ttsReady || cloudOn()) && said.isNotBlank()) {
-                        speak(said)
-                    } else {
-                        scan(false)
-                        setStatus(idleStatus())
-                    }
-                }
-            } catch (e: Exception) {
-                handler.post {
-                    scan(false)
-                    setStatus("Errore: " + e.message)
-                }
+            while (chat.size > 200) {
+                chat.removeAt(0)
             }
-        }.start()
+        }
+
+        android.os.Handler(mainLooper).post {
+            ui?.message(fromUser, text)
+        }
     }
 
-    // ---------- saluto di benvenuto ----------
+    private fun setStatus(message: String) {
+        lastStatus = message
 
-    private fun maybeGreet(force: Boolean) {
-        if (!KittTheme.greet(this)) return
-        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
-        val last = prefs.getLong("last_greet", 0L)
-        val now = System.currentTimeMillis()
-        if (!force && now - last < 6 * 3600 * 1000L) return
-        prefs.edit().putLong("last_greet", now).apply()
-        val text = "Ciao " + KittTheme.userName(this) + ", benvenuto a bordo."
-        dismissed = false
-        updateBubble()
-        addChat(false, text)
-        greetText = text
-        trySpeakGreeting()
+        android.os.Handler(mainLooper).post {
+            ui?.status(message)
+        }
     }
 
-    private fun trySpeakGreeting() {
-        val g = greetText ?: return
-        if (!ttsReady && !cloudOn()) return
-        greetText = null
-        speak(g)
+    private fun scan(on: Boolean) {
+        android.os.Handler(mainLooper).post {
+            ui?.scan(on)
+
+            if (on) scanner?.start()
+            else scanner?.stop()
+        }
     }
 
-    // ---------- pausa e ripresa ----------
+    private fun stopKitt() {
+        serviceActive = false
+
+        gemini?.close()
+        gemini = null
+
+        removeBubble()
+        scan(false)
+
+        setStatus("KITT spento")
+
+        stopForeground(true)
+    }
 
     private fun pauseKitt() {
         userPaused = true
-        handler.removeCallbacks(speakGuard)
-        stopCloud()
-        try {
-            tts?.stop()
-        } catch (e: Exception) {
-        }
-        abandonFocus()
-        busy = false
-        voice.keepAwake(0)
-        voice.paused = false
-        setStatus("In pausa. Di' \"Ciao KITT\" o tocca PLAY per riattivarmi")
-        handler.post {
-            refreshBubble()
-            bubbleScannerState()
-        }
+
+        gemini?.close()
+        gemini = null
+
+        scan(false)
+        refreshBubble()
+
+        setStatus("KITT in pausa.")
     }
 
     private fun resumeKitt() {
         userPaused = false
-        voice.keepAwake(10000)
-        handler.post {
-            refreshBubble()
-            bubbleScannerState()
-        }
-        onWake()
+        refreshBubble()
+        connectGemini()
     }
-
-    // ---------- bolla sullo schermo ----------
 
     private fun updateBubble() {
-        val should = serviceActive && !dismissed && !appVisible && Settings.canDrawOverlays(this)
-        if (should) showBubble() else removeBubble()
-        applyBubbleTheme()
-        refreshBubble()
-    }
+        if (!serviceActive || dismissed ||
+            appVisible || !Settings.canDrawOverlays(this)
+        ) {
+            removeBubble()
+            return
+        }
 
-    private fun applyBubbleTheme() {
-        val c = KittTheme.scanner(this)
-        bubbleScanner?.color = c
-        bubbleBg?.setStroke(dp(1), c)
-        bubblePause?.setTextColor(c)
-    }
-
-    private fun refreshBubble() {
-        bubblePause?.text = if (userPaused) "PLAY" else "STOP"
-        bubblePause?.visibility = if (controlsVisible || userPaused) View.VISIBLE else View.GONE
-        bubbleClose?.visibility = if (controlsVisible) View.VISIBLE else View.GONE
-    }
-
-    private fun bubbleScannerState() {
-        val s = bubbleScanner ?: return
-        if (userPaused) s.stop() else s.start(if (busy) 700L else 2800L)
+        showBubble()
     }
 
     private fun showBubble() {
         if (bubble != null) return
+
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val accent = KittTheme.scanner(this)
 
@@ -446,6 +365,7 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         box.orientation = LinearLayout.HORIZONTAL
         box.gravity = Gravity.CENTER_VERTICAL
         box.setPadding(dp(10), dp(8), dp(10), dp(8))
+
         val bg = GradientDrawable()
         bg.setColor(Color.parseColor("#E6000000"))
         bg.cornerRadius = dp(16).toFloat()
@@ -454,34 +374,39 @@ class KittService : Service(), TextToSpeech.OnInitListener {
 
         val sc = ScannerView(this)
         sc.color = accent
-        box.addView(sc, LinearLayout.LayoutParams(dp(120), dp(22)))
 
-        val pauseBtn = TextView(this)
-        pauseBtn.text = "STOP"
-        pauseBtn.setTextColor(accent)
-        pauseBtn.textSize = 12f
-        pauseBtn.typeface = Typeface.DEFAULT_BOLD
-        pauseBtn.setPadding(dp(14), dp(6), dp(6), dp(6))
-        pauseBtn.visibility = View.GONE
-        box.addView(pauseBtn)
-        pauseBtn.setOnClickListener {
-            if (userPaused) resumeKitt() else pauseKitt()
-            handler.removeCallbacks(hideControls)
-            handler.postDelayed(hideControls, 4000)
+        box.addView(
+            sc,
+            LinearLayout.LayoutParams(dp(110), dp(22))
+        )
+
+        val pause = TextView(this)
+        pause.text = "STOP"
+        pause.setTextColor(accent)
+        pause.textSize = 12f
+        pause.typeface = Typeface.DEFAULT_BOLD
+        pause.setPadding(dp(12), dp(6), dp(6), dp(6))
+
+        box.addView(pause)
+
+        pause.setOnClickListener {
+            if (userPaused) resumeKitt()
+            else pauseKitt()
         }
 
         val close = TextView(this)
         close.text = "✕"
-        close.setTextColor(Color.WHITE)
         close.textSize = 18f
+        close.setTextColor(Color.WHITE)
         close.setPadding(dp(10), 0, dp(4), 0)
         close.visibility = View.GONE
+
         box.addView(close)
+
         close.setOnClickListener {
             dismissed = true
-            controlsVisible = false
-            updateBubble()
-            setStatus("Bolla chiusa. Di' \"Ciao KITT\" per riaprirla")
+            removeBubble()
+            setStatus("Bolla chiusa. KITT continua a funzionare.")
         }
 
         val lp = WindowManager.LayoutParams(
@@ -489,9 +414,10 @@ class KittService : Service(), TextToSpeech.OnInitListener {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         )
+
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = bubbleX
         lp.y = bubbleY
@@ -501,582 +427,133 @@ class KittService : Service(), TextToSpeech.OnInitListener {
         var startX = 0
         var startY = 0
         var moved = false
-        box.setOnTouchListener { _, e ->
-            when (e.action) {
+
+        box.setOnTouchListener { _, event ->
+            when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = e.rawX
-                    downY = e.rawY
+                    downX = event.rawX
+                    downY = event.rawY
                     startX = lp.x
                     startY = lp.y
                     moved = false
                     true
                 }
+
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (e.rawX - downX).toInt()
-                    val dy = (e.rawY - downY).toInt()
-                    if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) moved = true
+                    val dx = (event.rawX - downX).toInt()
+                    val dy = (event.rawY - downY).toInt()
+
+                    if (kotlin.math.abs(dx) > dp(6) ||
+                        kotlin.math.abs(dy) > dp(6)
+                    ) {
+                        moved = true
+                    }
+
                     if (moved) {
                         lp.x = startX + dx
                         lp.y = startY + dy
                         bubbleX = lp.x
                         bubbleY = lp.y
+
                         try {
                             wm.updateViewLayout(box, lp)
-                        } catch (ex: Exception) {
+                        } catch (_: Exception) {
                         }
                     }
                     true
                 }
+
                 MotionEvent.ACTION_UP -> {
                     if (!moved) {
                         controlsVisible = !controlsVisible
-                        refreshBubble()
-                        handler.removeCallbacks(hideControls)
-                        if (controlsVisible) handler.postDelayed(hideControls, 4000)
+                        close.visibility =
+                            if (controlsVisible) View.VISIBLE else View.GONE
                     }
                     true
                 }
+
                 else -> false
             }
         }
 
         try {
             wm.addView(box, lp)
+
             bubble = box
-            bubbleScanner = sc
-            bubbleBg = bg
-            bubblePause = pauseBtn
+            scanner = sc
+            bubblePause = pause
             bubbleClose = close
-            bubbleScannerState()
-        } catch (e: Exception) {
+            bubbleBg = bg
+
+            if (userPaused) sc.stop()
+            else sc.start()
+
+            refreshBubble()
+        } catch (_: Exception) {
             bubble = null
-            bubbleScanner = null
-            bubbleBg = null
-            bubblePause = null
-            bubbleClose = null
         }
+    }
+
+    private fun refreshBubble() {
+        bubblePause?.text = if (userPaused) "PLAY" else "STOP"
+
+        bubbleClose?.visibility =
+            if (controlsVisible) View.VISIBLE else View.GONE
     }
 
     private fun removeBubble() {
-        val b = bubble ?: return
+        val old = bubble ?: return
+
         try {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-            wm.removeView(b)
-        } catch (e: Exception) {
+            wm.removeView(old)
+        } catch (_: Exception) {
         }
+
+        scanner?.stop()
         bubble = null
-        bubbleScanner = null
-        bubbleBg = null
+        scanner = null
         bubblePause = null
         bubbleClose = null
+        bubbleBg = null
     }
 
-    // ---------- stato e scanner ----------
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
 
-    private fun setStatus(text: String) {
-        val full = if (ttsProblem.isNotBlank()) text + "\n" + ttsProblem else text
-        lastStatus = full
-        handler.post { ui?.status(full) }
-    }
+        if (!stoppedByUser && serviceActive) {
+            val restart = Intent(this, KittService::class.java)
 
-    private fun scan(on: Boolean) {
-        handler.post {
-            ui?.scan(on)
-            val s = bubbleScanner
-            if (s != null) {
-                if (on) s.start(700L) else if (userPaused) s.stop() else s.start(2800L)
-            }
-        }
-    }
-
-    // ---------- ascolto ----------
-
-    private fun begin() {
-        if (voiceStarted) return
-        if (!brain.hasKey()) {
-            setStatus("Apri Impostazioni e inserisci la chiave Groq")
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            setStatus("Concedi il permesso del microfono a KITT")
-            return
-        }
-        voiceStarted = true
-        setStatus("Preparo l'ascolto...")
-        Thread {
-            prepareWake()
-            voice.paused = false
-            voice.start()
-            if (voice.wake != null) {
-                setStatus("In attesa: di' \"Ciao KITT\"")
-            } else {
-                setStatus("Ascolto sempre attivo. " + wakeError)
-            }
-        }.start()
-    }
-
-    private fun prepareWake() {
-        val modelDir = File(filesDir, "wake/vosk-model-small-en-us-0.15")
-        val okFile = File(filesDir, "wake/ok")
-        try {
-            if (!okFile.exists()) {
-                setStatus("Scarico il modello per 'Ciao KITT' (circa 40 MB), attendi...")
-                File(filesDir, "wake").deleteRecursively()
-                val url = URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
-                val conn = url.openConnection()
-                conn.connectTimeout = 15000
-                conn.readTimeout = 30000
-                ZipInputStream(conn.getInputStream().buffered()).use { zip ->
-                    var entry = zip.nextEntry
-                    while (entry != null) {
-                        val out = File(filesDir, "wake/" + entry.name)
-                        if (entry.isDirectory) {
-                            out.mkdirs()
-                        } else {
-                            out.parentFile?.mkdirs()
-                            FileOutputStream(out).use { zip.copyTo(it) }
-                        }
-                        entry = zip.nextEntry
-                    }
-                }
-                okFile.writeText("ok")
-            }
-            val model = Model(modelDir.absolutePath)
-            wakeModel = model
-            voice.wake = Recognizer(model, 16000.0f)
-        } catch (e: Exception) {
-            wakeError = "Parola di attivazione non disponibile: " + e.message
-        }
-    }
-
-    private fun onWake() {
-        if (userPaused) {
-            userPaused = false
-            handler.post {
-                refreshBubble()
-                bubbleScannerState()
-            }
-        }
-        setStatus("Ti ascolto...")
-        handler.post {
-            dismissed = false
-            updateBubble()
-        }
-        scan(true)
-        handler.postDelayed({ if (!busy) scan(false) }, 1500)
-    }
-
-    private fun onSleep() {
-        setStatus(idleStatus())
-    }
-
-    private fun resumeListening() {
-        handler.postDelayed({
-            if (!userPaused) voice.keepAwake(10000)
-            voice.paused = false
-        }, 500)
-    }
-
-    private fun finish(message: String?) {
-        busy = false
-        scan(false)
-        setStatus(message ?: "Ti ascolto...")
-        resumeListening()
-    }
-
-    private fun falseAlarm() {
-        busy = false
-        scan(false)
-        setStatus(idleStatus())
-        handler.postDelayed({
-            voice.keepAwake(0)
-            voice.paused = false
-        }, 300)
-    }
-
-    private fun looksLikeWake(text: String): Boolean {
-        val t = text.lowercase()
-        return listOf("kit", "chit", "ciao", "buongiorno", "buonasera", "hey", "ehi").any { t.contains(it) }
-    }
-
-    private fun onUtterance(pcm: ByteArray, fromWake: Boolean) {
-        busy = true
-        voice.paused = true
-        setStatus("Elaboro...")
-        scan(true)
-        Thread {
             try {
-                val (text, error) = brain.transcribe(pcm)
-                if (error.isNotBlank()) {
-                    finish(error)
-                    return@Thread
-                }
-                if (text.length < 2 || text.contains("assistente vocale dell", ignoreCase = true)) {
-                    if (fromWake) falseAlarm() else finish(null)
-                    return@Thread
-                }
-                if (fromWake && !looksLikeWake(text)) {
-                    falseAlarm()
-                    return@Thread
-                }
-                addChat(true, text)
-                setStatus("Hai detto: $text")
-                val r = brain.think(text)
-                handler.post {
-                    if (userPaused) {
-                        busy = false
-                        scan(false)
-                        return@post
-                    }
-                    val failure = commands.run(r.action, r.arg)
-                    val said = failure ?: r.reply
-                    setStatus(said)
-                    if (said.isNotBlank()) addChat(false, said)
-                    speak(said)
-                }
-            } catch (e: Exception) {
-                finish("Errore: " + e.message)
+                val pending = PendingIntent.getForegroundService(
+                    this,
+                    2,
+                    restart,
+                    PendingIntent.FLAG_IMMUTABLE or
+                        PendingIntent.FLAG_UPDATE_CURRENT
+                )
+
+                val alarm =
+                    getSystemService(ALARM_SERVICE) as android.app.AlarmManager
+
+                alarm.set(
+                    android.app.AlarmManager.ELAPSED_REALTIME,
+                    android.os.SystemClock.elapsedRealtime() + 2000,
+                    pending
+                )
+            } catch (_: Exception) {
             }
-        }.start()
-    }
-
-    // ---------- voce di KITT ----------
-
-    private fun cloudOn(): Boolean {
-        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
-        return prefs.getBoolean("cloud_on", false) &&
-                !prefs.getString("gemini_key", "").isNullOrBlank()
-    }
-
-    private fun stopCloud() {
-        cloudToken++
-        try {
-            player?.stop()
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun finishSpeech() {
-        handler.removeCallbacks(speakGuard)
-        abandonFocus()
-        busy = false
-        scan(false)
-        resumeListening()
-    }
-
-    private fun playPcm(pcm: ByteArray, rate: Int, a: AudioAttributes, token: Int) {
-        val size = pcm.size - (pcm.size % 2)
-        if (size <= 0) throw Exception("audio vuoto")
-        val fmt = AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setSampleRate(rate)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-            .build()
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(a)
-            .setAudioFormat(fmt)
-            .setBufferSizeInBytes(size)
-            .setTransferMode(AudioTrack.MODE_STATIC)
-            .build()
-        player = track
-        try {
-            track.write(pcm, 0, size)
-            val frames = size / 2
-            track.play()
-            val limit = SystemClock.elapsedRealtime() + frames * 1000L / rate + 3000L
-            while (token == cloudToken &&
-                track.playbackHeadPosition < frames &&
-                SystemClock.elapsedRealtime() < limit
-            ) {
-                Thread.sleep(40)
-            }
-        } finally {
-            try {
-                track.stop()
-            } catch (e: Exception) {
-            }
-            track.release()
-            player = null
-        }
-    }
-
-    private fun speakCloud(text: String) {
-        val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
-        val key = prefs.getString("gemini_key", "") ?: ""
-        var model = (prefs.getString("cloud_model", "") ?: "").trim()
-        if (model.isEmpty()) model = "gemini-3.1-flash-tts-preview"
-        if (model.startsWith("models/")) model = model.removePrefix("models/")
-        val voiceName = prefs.getString("cloud_voice", "Charon") ?: "Charon"
-
-        busy = true
-        voice.paused = true
-        scan(true)
-        val a = attrs(route())
-        requestFocus(a)
-        val token = ++cloudToken
-        handler.removeCallbacks(speakGuard)
-        handler.postDelayed(speakGuard, 25000L + text.length * 120L)
-        Thread {
-            try {
-                val (pcm, rate) = CloudTts.synth(key, model, voiceName, text)
-                if (token != cloudToken) return@Thread
-                playPcm(pcm, rate, a, token)
-                if (token == cloudToken) handler.post { finishSpeech() }
-            } catch (e: Exception) {
-                if (token == cloudToken) {
-                    handler.post {
-                        setStatus("Voce online non disponibile (" + (e.message ?: "errore") + "): uso la voce del sistema")
-                        speakSystem(text)
-                    }
-                }
-            }
-        }.start()
-    }
-
-    private fun isInstalled(pkg: String): Boolean = try {
-        packageManager.getPackageInfo(pkg, 0)
-        true
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun startTts() {
-        ttsReady = false
-        triedEngines.clear()
-        ttsLog.setLength(0)
-        ttsProblem = ""
-        currentEngine = "predefinito"
-        var pref = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_engine", "") ?: ""
-        if (pref.isEmpty() && isInstalled(SHERPA)) pref = SHERPA
-        if (pref.isNotEmpty() && !isInstalled(pref)) pref = ""
-        try {
-            tts?.shutdown()
-        } catch (e: Exception) {
-        }
-        if (pref.isNotEmpty()) {
-            currentEngine = pref
-            tts = TextToSpeech(this, this, pref)
-        } else {
-            tts = TextToSpeech(this, this)
-        }
-    }
-
-    private fun applyVoice(t: TextToSpeech) {
-        val name = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_voice", "") ?: ""
-        if (name.isEmpty()) return
-        try {
-            val v = (t.voices ?: emptySet()).firstOrNull { it.name == name }
-            if (v != null) t.setVoice(v)
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun sampleVoice() {
-        speak("Ciao " + KittTheme.userName(this) + ", sono KITT. Questa è la mia voce.")
-    }
-
-    private fun route(): Int =
-        getSharedPreferences("kitt", MODE_PRIVATE).getInt("tts_route", 0)
-
-    private fun attrs(route: Int): AudioAttributes {
-        val usage = when (route) {
-            1 -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
-            2 -> AudioAttributes.USAGE_ASSISTANT
-            3 -> AudioAttributes.USAGE_NOTIFICATION
-            4 -> AudioAttributes.USAGE_ALARM
-            5 -> AudioAttributes.USAGE_VOICE_COMMUNICATION
-            else -> AudioAttributes.USAGE_MEDIA
-        }
-        return AudioAttributes.Builder()
-            .setUsage(usage)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-    }
-
-    private fun requestFocus(a: AudioAttributes) {
-        try {
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(a)
-                .build()
-            focusRequest = req
-            am.requestAudioFocus(req)
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun abandonFocus() {
-        try {
-            val req = focusRequest ?: return
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            am.abandonAudioFocusRequest(req)
-        } catch (e: Exception) {
-        }
-        focusRequest = null
-    }
-
-    private fun testVoice() {
-        val next = (route() + 1) % routeNames.size
-        getSharedPreferences("kitt", MODE_PRIVATE).edit().putInt("tts_route", next).apply()
-        val am = getSystemService(AUDIO_SERVICE) as AudioManager
-        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        setStatus(
-            "Canale voce: " + routeNames[next] + " (volume media " + vol + "/" + max +
-                    "). Per cambiare canale premi di nuovo Prova voce in Impostazioni."
-        )
-        speak("Prova voce, canale " + routeNames[next])
-    }
-
-    override fun onInit(initStatus: Int) {
-        val t = tts ?: return
-        if (engines.isEmpty()) {
-            try {
-                engines = t.engines.map { it.name }
-            } catch (e: Exception) {
-            }
-        }
-        val name = if (currentEngine == "predefinito") {
-            try {
-                t.defaultEngine ?: "predefinito"
-            } catch (e: Exception) {
-                "predefinito"
-            }
-        } else {
-            currentEngine
-        }
-        currentEngine = name
-        triedEngines.add(name)
-
-        if (initStatus != TextToSpeech.SUCCESS) {
-            ttsLog.append("[" + name + ": non si avvia] ")
-            nextEngine()
-            return
-        }
-
-        var best = TextToSpeech.LANG_NOT_SUPPORTED
-        for (loc in listOf(Locale.ITALIAN, Locale.ITALY, Locale("it", "IT"))) {
-            val r = t.setLanguage(loc)
-            if (r > best) best = r
-            if (r >= TextToSpeech.LANG_AVAILABLE) break
-        }
-        if (best < TextToSpeech.LANG_AVAILABLE) {
-            ttsLog.append("[" + name + ": italiano codice " + best + "] ")
-            nextEngine()
-            return
-        }
-
-        ttsReady = true
-        ttsProblem = ""
-        try {
-            voiceNames = (t.voices ?: emptySet())
-                .filter { it.locale.language == "it" }
-                .map { it.name }
-                .sorted()
-        } catch (e: Exception) {
-            voiceNames = emptyList()
-        }
-        applyVoice(t)
-        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                voice.paused = true
-                scan(true)
-            }
-            override fun onDone(utteranceId: String?) {
-                handler.removeCallbacks(speakGuard)
-                abandonFocus()
-                busy = false
-                scan(false)
-                resumeListening()
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                handler.removeCallbacks(speakGuard)
-                abandonFocus()
-                busy = false
-                scan(false)
-                resumeListening()
-            }
-        })
-        val chosen = getSharedPreferences("kitt", MODE_PRIVATE).getString("tts_voice", "") ?: ""
-        setStatus("Voce pronta (" + name + (if (chosen.isNotEmpty()) ", " + chosen else "") + ")")
-        trySpeakGreeting()
-        if (sampleWhenReady) {
-            sampleWhenReady = false
-            sampleVoice()
-        }
-    }
-
-    private fun nextEngine() {
-        val next = engines
-            .filter { it !in triedEngines }
-            .sortedBy {
-                when (it) {
-                    SHERPA -> 0
-                    ESPEAK -> 1
-                    else -> 2
-                }
-            }
-            .firstOrNull()
-        if (next == null) {
-            val list = if (engines.isEmpty()) "nessuno" else engines.joinToString(", ")
-            ttsProblem = "Voce: italiano non disponibile. Motori trovati: " + list + ". " + ttsLog
-            setStatus("Nessuna voce italiana")
-            return
-        }
-        currentEngine = next
-        tts?.shutdown()
-        tts = TextToSpeech(this, this, next)
-    }
-
-    private fun speak(text: String) {
-        if (text.isBlank()) {
-            busy = false
-            scan(false)
-            resumeListening()
-            return
-        }
-        if (cloudOn()) speakCloud(text) else speakSystem(text)
-    }
-
-    private fun speakSystem(text: String) {
-        if (ttsReady && text.isNotBlank()) {
-            busy = true
-            val prefs = getSharedPreferences("kitt", MODE_PRIVATE)
-            tts?.let { applyVoice(it) }
-            tts?.setSpeechRate(prefs.getInt("tts_rate", 100) / 100f)
-            tts?.setPitch(prefs.getInt("tts_pitch", 100) / 100f)
-            val a = attrs(route())
-            tts?.setAudioAttributes(a)
-            requestFocus(a)
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "kitt")
-            handler.removeCallbacks(speakGuard)
-            handler.postDelayed(speakGuard, 8000L + text.length * 100L)
-        } else {
-            busy = false
-            scan(false)
-            resumeListening()
         }
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(watchdog)
-        handler.removeCallbacks(speakGuard)
-        handler.removeCallbacks(hideControls)
-        stopCloud()
+        gemini?.close()
+        gemini = null
+
         visibilityCallback = null
         removeBubble()
-        abandonFocus()
-        releaseLocks()
-        voice.stop()
-        try {
-            voice.wake?.close()
-            wakeModel?.close()
-        } catch (e: Exception) {
-        }
-        tts?.shutdown()
+        scan(false)
+
         super.onDestroy()
     }
 }

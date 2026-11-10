@@ -38,8 +38,6 @@ class KittService : Service() {
         @Volatile var appVisible = false
         @Volatile var visibilityCallback: (() -> Unit)? = null
 
-        @Volatile var voiceNames: List<String> = emptyList()
-
         val chat: MutableList<Pair<Boolean, String>> =
             java.util.Collections.synchronizedList(
                 ArrayList<Pair<Boolean, String>>()
@@ -185,7 +183,7 @@ class KittService : Service() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle("K.I.T.T. attivo")
-            .setContentText("Di' Ciao KITT per parlare")
+            .setContentText("Gemini Live attivo in background")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(open)
             .addAction(0, "Spegni", stop)

@@ -1,3 +1,4 @@
+
 package com.kitt.app
 
 import android.annotation.SuppressLint
@@ -17,6 +18,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,8 +31,9 @@ class GeminiLiveClient(
     private val onToolCall: (String, String) -> String?,
     private val onClosed: (String) -> Unit
 ) {
+
     companion object {
-        private const val MODEL = "gemini-3.1-flash-live-preview"
+        private const val MODEL = "gemini-3.8-live"
         private const val INPUT_RATE = 16000
         private const val OUTPUT_RATE = 24000
     }
@@ -41,149 +44,228 @@ class GeminiLiveClient(
         .build()
 
     private val audioExecutor = Executors.newSingleThreadExecutor()
+
     private val running = AtomicBoolean(false)
     private val setupReady = AtomicBoolean(false)
+    private val closedByUser = AtomicBoolean(false)
 
-    @Volatile private var socket: WebSocket? = null
-    @Volatile private var recorder: AudioRecord? = null
-    @Volatile private var player: AudioTrack? = null
-    @Volatile private var micThread: Thread? = null
-    @Volatile private var echoCanceler: AcousticEchoCanceler? = null
-    @Volatile private var noiseSuppressor: NoiseSuppressor? = null
+    private val pendingLock = Any()
+    private val pendingTexts = ArrayList<String>()
+
+    @Volatile
+    private var socket: WebSocket? = null
+
+    @Volatile
+    private var recorder: AudioRecord? = null
+
+    @Volatile
+    private var player: AudioTrack? = null
+
+    @Volatile
+    private var micThread: Thread? = null
+
+    @Volatile
+    private var echoCanceler: AcousticEchoCanceler? = null
+
+    @Volatile
+    private var noiseSuppressor: NoiseSuppressor? = null
 
     fun start() {
         if (apiKey.isBlank()) {
-            onClosed("Inserisci la chiave Gemini Live nelle impostazioni.")
+            onClosed("Manca la chiave API di Gemini.")
             return
         }
 
         if (!running.compareAndSet(false, true)) return
 
-        onStatus("Collegamento a Gemini Live...")
+        closedByUser.set(false)
+        onStatus("Connessione a Gemini Live...")
 
-        val url =
-            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        try {
+            val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
 
-        val request = Request.Builder()
-            .url(url)
-            .build()
+            val url =
+                "wss://generativelanguage.googleapis.com/ws/" +
+                "google.ai.generativelanguage.v1beta.GenerativeService." +
+                "BidiGenerateContent?key=$encodedKey"
 
-        socket = client.newWebSocket(
-            request,
-            object : WebSocketListener() {
+            val request = Request.Builder()
+                .url(url)
+                .build()
 
-                override fun onOpen(
-                    webSocket: WebSocket,
-                    response: Response
-                ) {
-                    val setup = JSONObject().put(
-                        "setup",
-                        JSONObject()
-                            .put("model", "models/$MODEL")
+            socket = client.newWebSocket(
+                request,
+                object : WebSocketListener() {
+
+                    override fun onOpen(
+                        webSocket: WebSocket,
+                        response: Response
+                    ) {
+                        onStatus("Invio configurazione Gemini...")
+
+                        val setup = JSONObject()
                             .put(
-                                "generationConfig",
+                                "setup",
                                 JSONObject()
+                                    .put("model", "models/$MODEL")
                                     .put(
-                                        "responseModalities",
-                                        JSONArray().put("AUDIO")
+                                        "generationConfig",
+                                        JSONObject()
+                                            .put(
+                                                "responseModalities",
+                                                JSONArray().put("AUDIO")
+                                            )
+                                            .put(
+                                                "speechConfig",
+                                                JSONObject()
+                                                    .put(
+                                                        "voiceConfig",
+                                                        JSONObject()
+                                                            .put(
+                                                                "prebuiltVoiceConfig",
+                                                                JSONObject()
+                                                                    .put(
+                                                                        "voiceName",
+                                                                        "Charon"
+                                                                    )
+                                                            )
+                                                    )
+                                            )
                                     )
                                     .put(
-                                        "speechConfig",
-                                        JSONObject().put(
-                                            "voiceConfig",
-                                            JSONObject().put(
-                                                "prebuiltVoiceConfig",
-                                                JSONObject().put(
-                                                    "voiceName",
-                                                    "Charon"
+                                        "systemInstruction",
+                                        JSONObject()
+                                            .put(
+                                                "parts",
+                                                JSONArray().put(
+                                                    JSONObject().put(
+                                                        "text",
+                                                        systemPrompt()
+                                                    )
                                                 )
                                             )
-                                        )
+                                    )
+                                    .put(
+                                        "inputAudioTranscription",
+                                        JSONObject()
+                                    )
+                                    .put(
+                                        "outputAudioTranscription",
+                                        JSONObject()
+                                    )
+                                    .put(
+                                        "tools",
+                                        toolDefinitions()
                                     )
                             )
-                            .put(
-                                "systemInstruction",
-                                JSONObject().put(
-                                    "parts",
-                                    JSONArray().put(
-                                        JSONObject().put(
-                                            "text",
-                                            systemPrompt()
-                                        )
-                                    )
-                                )
+
+                        webSocket.send(setup.toString())
+                    }
+
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        text: String
+                    ) {
+                        try {
+                            handleServerMessage(JSONObject(text))
+                        } catch (e: Exception) {
+                            onStatus(
+                                "Errore nella risposta Gemini: " +
+                                (e.message ?: "risposta non valida")
                             )
-                            .put("inputAudioTranscription", JSONObject())
-                            .put("outputAudioTranscription", JSONObject())
-                            .put("tools", toolDefinitions())
-                    )
+                        }
+                    }
 
-                    webSocket.send(setup.toString())
-                }
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        bytes: ByteString
+                    ) {
+                        onStatus("Ricevuto un pacchetto audio non previsto.")
+                    }
 
-                override fun onMessage(
-                    webSocket: WebSocket,
-                    text: String
-                ) {
-                    try {
-                        handleServerMessage(JSONObject(text))
-                    } catch (e: Exception) {
-                        onStatus(
-                            "Risposta Gemini non leggibile: ${e.message}"
-                        )
+                    override fun onFailure(
+                        webSocket: WebSocket,
+                        t: Throwable,
+                        response: Response?
+                    ) {
+                        stopAudio()
+                        running.set(false)
+
+                        val detail = response?.let {
+                            "HTTP ${it.code}: ${it.message}"
+                        } ?: (t.message ?: "errore di rete")
+
+                        if (!closedByUser.get()) {
+                            onClosed("Errore Gemini Live: $detail")
+                        }
+                    }
+
+                    override fun onClosed(
+                        webSocket: WebSocket,
+                        code: Int,
+                        reason: String
+                    ) {
+                        stopAudio()
+                        running.set(false)
+
+                        if (!closedByUser.get()) {
+                            onClosed(
+                                "Gemini Live ha chiuso la sessione: $reason"
+                            )
+                        }
                     }
                 }
+            )
 
-                override fun onMessage(
-                    webSocket: WebSocket,
-                    bytes: ByteString
-                ) {
-                    onStatus("Ricevuto un messaggio audio non previsto.")
-                }
-
-                override fun onFailure(
-                    webSocket: WebSocket,
-                    t: Throwable,
-                    response: Response?
-                ) {
-                    stopAudio()
-                    running.set(false)
-
-                    onClosed(
-                        "Connessione Gemini Live non riuscita: " +
-                            (t.message ?: "errore di rete")
-                    )
-                }
-
-                override fun onClosed(
-                    webSocket: WebSocket,
-                    code: Int,
-                    reason: String
-                ) {
-                    stopAudio()
-                    running.set(false)
-                    onClosed("Sessione Gemini chiusa: $reason")
-                }
-            }
-        )
+        } catch (e: Exception) {
+            running.set(false)
+            onClosed("Errore di connessione: ${e.message}")
+        }
     }
 
     fun sendText(text: String) {
-        if (!setupReady.get() || text.isBlank()) return
+        if (text.isBlank() || !running.get()) return
 
-        socket?.send(
-            JSONObject()
-                .put(
-                    "realtimeInput",
-                    JSONObject().put("text", text)
-                )
-                .toString()
-        )
+        if (!setupReady.get()) {
+            synchronized(pendingLock) {
+                pendingTexts.add(text)
+            }
+            return
+        }
+
+        sendTextNow(text)
+    }
+
+    private fun sendTextNow(text: String) {
+        val message = JSONObject()
+            .put(
+                "realtimeInput",
+                JSONObject().put("text", text)
+            )
+
+        socket?.send(message.toString())
+    }
+
+    private fun flushPendingTexts() {
+        val messages = synchronized(pendingLock) {
+            val copy = pendingTexts.toList()
+            pendingTexts.clear()
+            copy
+        }
+
+        for (message in messages) {
+            sendTextNow(message)
+        }
     }
 
     fun close() {
+        closedByUser.set(true)
         running.set(false)
         setupReady.set(false)
+
+        synchronized(pendingLock) {
+            pendingTexts.clear()
+        }
 
         try {
             socket?.close(1000, "KITT stopped")
@@ -195,16 +277,21 @@ class GeminiLiveClient(
     }
 
     private fun handleServerMessage(root: JSONObject) {
+
         if (root.has("setupComplete")) {
             setupReady.set(true)
+
+            onStatus("Gemini Live collegato. Microfono attivo.")
+
             startAudio()
-            onStatus("Gemini Live pronto. Ti ascolto.")
+            flushPendingTexts()
             return
         }
 
         val server = root.optJSONObject("serverContent")
 
         if (server != null) {
+
             if (server.optBoolean("interrupted", false)) {
                 flushPlayback()
             }
@@ -212,12 +299,12 @@ class GeminiLiveClient(
             server.optJSONObject("inputTranscription")
                 ?.optString("text")
                 ?.takeIf { it.isNotBlank() }
-                ?.let(onUserText)
+                ?.let { onUserText(it) }
 
             server.optJSONObject("outputTranscription")
                 ?.optString("text")
                 ?.takeIf { it.isNotBlank() }
-                ?.let(onAssistantText)
+                ?.let { onAssistantText(it) }
 
             val parts = server
                 .optJSONObject("modelTurn")
@@ -225,9 +312,10 @@ class GeminiLiveClient(
 
             if (parts != null) {
                 for (i in 0 until parts.length()) {
-                    val inline = parts
-                        .optJSONObject(i)
-                        ?.optJSONObject("inlineData")
+
+                    val part = parts.optJSONObject(i) ?: continue
+
+                    val inline = part.optJSONObject("inlineData")
                         ?: continue
 
                     val encoded = inline.optString("data")
@@ -246,57 +334,70 @@ class GeminiLiveClient(
             }
         }
 
+        handleToolCalls(root)
+    }
+
+    private fun handleToolCalls(root: JSONObject) {
         val call = root.optJSONObject("toolCall")
-        val calls = call?.optJSONArray("functionCalls")
+            ?: return
 
-        if (calls != null) {
-            val responses = JSONArray()
+        val calls = call.optJSONArray("functionCalls")
+            ?: return
 
-            for (i in 0 until calls.length()) {
-                val function = calls.optJSONObject(i) ?: continue
+        val responses = JSONArray()
 
-                val name = function.optString("name")
-                val id = function.optString("id")
-                val args = function.optJSONObject("args") ?: JSONObject()
+        for (i in 0 until calls.length()) {
 
-                val action = args.optString("action")
-                val arg = args.optString("arg")
+            val function = calls.optJSONObject(i)
+                ?: continue
 
-                val result = if (name == "run_command") {
+            val name = function.optString("name")
+            val id = function.optString("id")
+            val args = function.optJSONObject("args")
+                ?: JSONObject()
+
+            val action = args.optString("action")
+            val arg = args.optString("arg")
+
+            val result = try {
+                if (name == "run_command") {
                     onToolCall(action, arg)
                 } else {
                     "Comando non riconosciuto."
                 }
-
-                responses.put(
-                    JSONObject()
-                        .put("id", id)
-                        .put("name", name)
-                        .put(
-                            "response",
-                            JSONObject().put(
-                                "result",
-                                result ?: "Comando eseguito."
-                            )
-                        )
-                )
+            } catch (e: Exception) {
+                "Errore durante l'esecuzione del comando."
             }
 
-            socket?.send(
+            responses.put(
                 JSONObject()
+                    .put("id", id)
+                    .put("name", name)
                     .put(
-                        "toolResponse",
+                        "response",
                         JSONObject().put(
-                            "functionResponses",
-                            responses
+                            "result",
+                            result ?: "Comando eseguito."
                         )
                     )
-                    .toString()
             )
         }
+
+        socket?.send(
+            JSONObject()
+                .put(
+                    "toolResponse",
+                    JSONObject().put(
+                        "functionResponses",
+                        responses
+                    )
+                )
+                .toString()
+        )
     }
 
     private fun toolDefinitions(): JSONArray {
+
         val properties = JSONObject()
             .put(
                 "action",
@@ -304,7 +405,7 @@ class GeminiLiveClient(
                     .put("type", "STRING")
                     .put(
                         "description",
-                        "Comando da eseguire, per esempio open_app, volume_up, play_music, navigate, call, send_sms."
+                        "Comando locale da eseguire sul dispositivo."
                     )
             )
             .put(
@@ -313,7 +414,7 @@ class GeminiLiveClient(
                     .put("type", "STRING")
                     .put(
                         "description",
-                        "Parametro del comando; stringa vuota se non serve."
+                        "Parametro del comando."
                     )
             )
 
@@ -321,7 +422,7 @@ class GeminiLiveClient(
             .put("name", "run_command")
             .put(
                 "description",
-                "Esegue un comando locale sul dispositivo solo quando l'utente lo richiede chiaramente. Per inviare SMS usa send_sms e poi chiedi conferma esplicita prima di confirm."
+                "Esegue un comando locale solo quando Simone lo richiede chiaramente."
             )
             .put(
                 "parameters",
@@ -344,25 +445,56 @@ class GeminiLiveClient(
 
     private fun systemPrompt(): String {
         return """
-            Sei K.I.T.T., assistente vocale di bordo in italiano.
-            Parli in modo naturale, breve e chiaro, con tono calmo e maschile.
+            Sei K.I.T.T., l'assistente vocale di bordo di Simone.
+
+            Parli esclusivamente in italiano, con voce maschile,
+            naturale, calma e chiara.
+
             L'utente è Simone, il pilota.
-            Chiamalo Simone quando naturale.
+
+            Il microfono può restare attivo anche quando Simone
+            non sta parlando direttamente con te.
+
+            Non intervenire sulle conversazioni ambientali.
+            Rispondi quando riconosci un richiamo rivolto a te,
+            come:
+            - Ciao KITT
+            - Ehi KITT
+            - Hey KITT
+            - Buongiorno KITT
+            - Buonasera KITT
+            - KITT
+            oppure quando Simone ti rivolge chiaramente una domanda
+            o un comando.
+
+            Dopo un saluto, rispondi brevemente e resta disponibile
+            per il comando successivo.
+
+            Mantieni il dialogo naturale senza richiedere ogni volta
+            di ripetere il tuo nome.
+
+            In automobile privilegia risposte brevi e la sicurezza.
+
             Non dire di essere Gemini.
-            Rispondi in italiano, salvo richiesta diversa.
-            In auto privilegia frasi brevi e sicurezza.
-            Non affermare di aver eseguito azioni se il comando non è riuscito.
-            Usa run_command solo per azioni sul dispositivo chiaramente richieste.
-            Per chiamate, SMS, navigazione e app specifiche chiedi chiarimenti
-            se manca il destinatario o il contenuto.
-            Per SMS prepara il messaggio con send_sms e chiedi conferma esplicita.
-            Solo dopo un sì chiaro esegui confirm.
-            Non inventare dati in tempo reale.
+
+            Non affermare di aver eseguito un'azione se non è riuscita.
+
+            Usa run_command solo per azioni sul dispositivo
+            chiaramente richieste da Simone.
+
+            Per chiamate, SMS e azioni importanti chiedi conferma
+            quando necessario.
+
+            Per inviare SMS prepara prima il messaggio e chiedi
+            conferma esplicita prima di inviare.
+
+            Non inventare informazioni in tempo reale.
         """.trimIndent()
     }
 
     @SuppressLint("MissingPermission")
     private fun startAudio() {
+
         if (!running.get() || recorder != null) return
 
         try {
@@ -372,16 +504,25 @@ class GeminiLiveClient(
                 AudioFormat.ENCODING_PCM_16BIT
             )
 
+            if (minIn <= 0) {
+                throw IllegalStateException(
+                    "Configurazione microfono non supportata"
+                )
+            }
+
             val rec = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 INPUT_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-                maxOf(minIn, 4096)
+                maxOf(minIn, 8192)
             )
 
             if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                throw IllegalStateException("Microfono non inizializzato")
+                rec.release()
+                throw IllegalStateException(
+                    "Microfono non inizializzato"
+                )
             }
 
             recorder = rec
@@ -389,13 +530,17 @@ class GeminiLiveClient(
             if (AcousticEchoCanceler.isAvailable()) {
                 echoCanceler = AcousticEchoCanceler
                     .create(rec.audioSessionId)
-                    ?.apply { enabled = true }
+                    ?.apply {
+                        enabled = true
+                    }
             }
 
             if (NoiseSuppressor.isAvailable()) {
                 noiseSuppressor = NoiseSuppressor
                     .create(rec.audioSessionId)
-                    ?.apply { enabled = true }
+                    ?.apply {
+                        enabled = true
+                    }
             }
 
             val minOut = AudioTrack.getMinBufferSize(
@@ -403,6 +548,12 @@ class GeminiLiveClient(
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
+
+            if (minOut <= 0) {
+                throw IllegalStateException(
+                    "Configurazione audio in uscita non supportata"
+                )
+            }
 
             player = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -427,41 +578,56 @@ class GeminiLiveClient(
                 .setBufferSizeInBytes(maxOf(minOut, 8192))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-                .apply { play() }
+                .apply {
+                    play()
+                }
 
             rec.startRecording()
 
             micThread = Thread {
                 val buffer = ByteArray(2048)
 
-                while (running.get() && setupReady.get()) {
-                    val count = rec.read(
-                        buffer,
-                        0,
-                        buffer.size
-                    )
+                try {
+                    while (running.get() && setupReady.get()) {
 
-                    if (count > 0) {
-                        val audio = JSONObject()
-                            .put(
-                                "data",
-                                Base64.encodeToString(
-                                    buffer.copyOf(count),
-                                    Base64.NO_WRAP
+                        val count = rec.read(
+                            buffer,
+                            0,
+                            buffer.size
+                        )
+
+                        if (count > 0) {
+
+                            val audio = JSONObject()
+                                .put(
+                                    "data",
+                                    Base64.encodeToString(
+                                        buffer.copyOf(count),
+                                        Base64.NO_WRAP
+                                    )
                                 )
-                            )
-                            .put(
-                                "mimeType",
-                                "audio/pcm;rate=16000"
-                            )
+                                .put(
+                                    "mimeType",
+                                    "audio/pcm;rate=16000"
+                                )
 
-                        socket?.send(
-                            JSONObject()
+                            val message = JSONObject()
                                 .put(
                                     "realtimeInput",
                                     JSONObject().put("audio", audio)
                                 )
-                                .toString()
+
+                            socket?.send(message.toString())
+                        } else if (count < 0) {
+                            throw IllegalStateException(
+                                "Errore lettura microfono: $count"
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (running.get()) {
+                        onStatus(
+                            "Problema microfono: ${e.message}"
                         )
                     }
                 }
@@ -472,7 +638,10 @@ class GeminiLiveClient(
 
         } catch (e: Exception) {
             onStatus("Errore avvio audio: ${e.message}")
-            close()
+            running.set(false)
+            stopAudio()
+            socket?.close(1011, "Audio initialization failed")
+            onClosed("Impossibile avviare il microfono: ${e.message}")
         }
     }
 
@@ -499,26 +668,29 @@ class GeminiLiveClient(
     }
 
     private fun stopAudio() {
-        try {
-            recorder?.stop()
-        } catch (_: Exception) {
-        }
 
-        try {
-            recorder?.release()
-        } catch (_: Exception) {
-        }
-
+        val oldRecorder = recorder
         recorder = null
 
         try {
-            player?.pause()
-            player?.flush()
-            player?.release()
+            oldRecorder?.stop()
         } catch (_: Exception) {
         }
 
+        try {
+            oldRecorder?.release()
+        } catch (_: Exception) {
+        }
+
+        val oldPlayer = player
         player = null
+
+        try {
+            oldPlayer?.pause()
+            oldPlayer?.flush()
+            oldPlayer?.release()
+        } catch (_: Exception) {
+        }
 
         try {
             echoCanceler?.release()
@@ -533,6 +705,8 @@ class GeminiLiveClient(
         }
 
         noiseSuppressor = null
+
+        micThread?.interrupt()
         micThread = null
     }
 }

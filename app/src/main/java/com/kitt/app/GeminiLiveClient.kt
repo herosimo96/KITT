@@ -31,7 +31,7 @@ class GeminiLiveClient(
     private val onClosed: (String) -> Unit
 ) {
     companion object {
-        private const val MODEL = "gemini-3.8-live"
+        private const val MODEL = "gemini-2.0-flash-exp"
         private const val INPUT_RATE = 16000
         private const val OUTPUT_RATE = 24000
     }

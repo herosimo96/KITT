@@ -17,7 +17,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var edtInput: EditText
     private lateinit var btnSend: Button
 
-    // Inserisci qui la tua chiave o recuperala dalle preferenze
+    // Inserisci qui la tua chiave API di Gemini
     private var apiKey = "TUA_CHIAVE_API_QUI"
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             val result = tts.setLanguage(Locale.ITALIAN)
             if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Toast.FMakeText(this, "Lingua italiana non supportata dal TTS", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Lingua italiana non supportata dal TTS", Toast.LENGTH_SHORT).show()
             }
         } else {
             Toast.makeText(this, "Inizializzazione voce fallita", Toast.LENGTH_SHORT).show()

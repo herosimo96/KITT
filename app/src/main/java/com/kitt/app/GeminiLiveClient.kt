@@ -30,7 +30,7 @@ class GeminiLiveClient(
     private val onClosed: (String) -> Unit
 ) {
     companion object {
-        private const val MODEL = "gemini-2.0-flash"
+        private const val MODEL = "gemini-2.0-flash-exp"
         private const val INPUT_RATE = 16000
         private const val OUTPUT_RATE = 24000
     }
@@ -68,9 +68,10 @@ class GeminiLiveClient(
 
         try {
             val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
+            // CORRETTO: Passato da v1beta a v1alpha per supportare BidiGenerateContent
             val url =
                 "wss://generativelanguage.googleapis.com/ws/" +
-                "google.ai.generativelanguage.v1beta.GenerativeService." +
+                "google.ai.generativelanguage.v1alpha.GenerativeService." +
                 "BidiGenerateContent?key=$encodedKey"
 
             val request = Request.Builder().url(url).build()
@@ -424,7 +425,7 @@ class GeminiLiveClient(
             Per chiamate, SMS e azioni importanti chiedi conferma
             quando necessario.
 
-            For inviare SMS prepara prima il messaggio e chiedi
+            Per inviare SMS prepara prima il messaggio e chiedi
             conferma esplicita prima di inviare.
 
             Non inventare informazioni in tempo reale.

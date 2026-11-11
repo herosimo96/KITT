@@ -46,17 +46,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun sendToKitt(prompt: String) {
         txtStatus.text = "KITT sta elaborando..."
-        GeminiRestClient.sendMessage(apiKey, prompt) { responseText ->
-            runOnUiThread {
-                if (responseText != null) {
-                    appendChat("KITT: $responseText")
-                    txtStatus.text = "Pronto"
-                    speakOut(responseText)
-                } else {
-                    txtStatus.text = "Errore di risposta"
+        GeminiRestClient.sendMessage(apiKey, prompt, object : (String?) -> Unit {
+            override fun invoke(responseText: String?) {
+                runOnUiThread {
+                    if (responseText != null) {
+                        appendChat("KITT: $responseText")
+                        txtStatus.text = "Pronto"
+                        speakOut(responseText)
+                    } else {
+                        txtStatus.text = "Errore di risposta"
+                    }
                 }
             }
-        }
+        })
     }
 
     private fun speakOut(text: String) {
@@ -82,8 +84,4 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         if (::tts.isInitialized) {
             tts.stop()
-            tts.shutdown()
-        }
-        super.onDestroy()
-    }
-}
+            tts.
